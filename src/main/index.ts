@@ -6,7 +6,7 @@ import { delimiter, join, normalize, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { APP_ID, APP_NAME, externalLinkOrigins, services } from './config';
 import { createSidecar } from './sidecar';
-import { parseNodeInput, Workspace } from './workspace';
+import { parseImportKeys, parseLinkInput, parseNodeInput, Workspace } from './workspace';
 
 const APP_ORIGIN = 'app://app';
 // In development the renderer is served by the Vite dev server; in a build it is served from the app:// protocol.
@@ -37,9 +37,8 @@ async function pickFolder({ title, defaultPath }: { title: string; defaultPath: 
 const scriptedFiles: string[] = !app.isPackaged && process.env['AB_E2E_PICK_FILE'] ? process.env['AB_E2E_PICK_FILE'].split(delimiter) : [];
 
 /** Shows the OS file picker (a single file); `null` if the user cancels. */
-async function pickFile(): Promise<string | null> {
+async function pickFile(options: Electron.OpenDialogOptions = { title: 'Choose a file for the node', properties: ['openFile'] }): Promise<string | null> {
   if (scriptedFiles.length > 0) return scriptedFiles.shift() || null;
-  const options: Electron.OpenDialogOptions = { title: 'Choose a file for the node', properties: ['openFile'] };
   const window = BrowserWindow.getFocusedWindow();
   const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
   return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]!;
@@ -175,6 +174,19 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.handle('terrane:workspace.current', (event) => (trusted(event), workspace.state()));
     ipcMain.handle('terrane:workspace.readNode', (event, id: unknown) => (trusted(event), typeof id === 'string' ? workspace.readNode(id) : Promise.reject(new Error('Invalid node id'))));
     ipcMain.handle('terrane:workspace.pickFile', (event) => (trusted(event), pickFile()));
+    // The JSON file to import is the one last chosen with the import picker; the renderer only names the keys of its nodes and links.
+    let importFile: string | null = null;
+    ipcMain.handle('terrane:workspace.pickImportFile', async (event) => {
+      trusted(event);
+      importFile = await pickFile({ title: 'Choose a JSON file to import', properties: ['openFile'], filters: [{ name: 'JSON', extensions: ['json'] }] });
+      return importFile;
+    });
+    ipcMain.handle('terrane:workspace.importFile', (event, keys: unknown) => {
+      trusted(event);
+      const parsed = parseImportKeys(keys);
+      if (!importFile) throw new Error('No file was chosen');
+      return workspace.importFile(importFile, parsed);
+    });
     ipcMain.handle('terrane:workspace.createNode', (event, input: unknown) => (trusted(event), workspace.createNode(parseNodeInput(input))));
     ipcMain.handle('terrane:workspace.updateNode', (event, id: unknown, input: unknown) => {
       trusted(event);
@@ -186,10 +198,11 @@ if (!app.requestSingleInstanceLock()) {
       if (typeof source !== 'string' || typeof target !== 'string') throw new Error('Invalid link');
       return workspace.createLink(source, target);
     });
-    ipcMain.handle('terrane:workspace.setLinkWeight', (event, id: unknown, weight: unknown) => {
+    ipcMain.handle('terrane:workspace.saveLayout', (event, layout: unknown) => (trusted(event), workspace.saveLayout(layout)));
+    ipcMain.handle('terrane:workspace.updateLink', (event, id: unknown, input: unknown) => {
       trusted(event);
-      if (typeof id !== 'string' || typeof weight !== 'number') throw new Error('Invalid link weight');
-      return workspace.setLinkWeight(id, weight);
+      if (typeof id !== 'string') throw new Error('Invalid link id');
+      return workspace.updateLink(id, parseLinkInput(input));
     });
     try {
       await manager.restore();

@@ -71,6 +71,62 @@ export interface WorkspaceLink {
   target: string;
   /** 1 to 10. */
   weight: number;
+  /** Text about the link; `null` if it has none. */
+  description: string | null;
+}
+
+/** What the link dialog sends to save a link. An empty description is stored as `null`. */
+export interface LinkInput {
+  weight: number;
+  description: string;
+}
+
+/** `value` as a `LinkInput`, or an error if it is not one. */
+export function parseLinkInput(value: unknown): LinkInput {
+  const input = value as Partial<LinkInput> | null;
+  if (typeof input !== 'object' || input === null || typeof input.weight !== 'number' || typeof input.description !== 'string') throw new Error('Invalid link');
+  return { weight: input.weight, description: input.description };
+}
+
+/** The top-level keys of a JSON file to import: of the array of nodes, and of the array of links. */
+export interface ImportKeys {
+  nodesKey: string;
+  linksKey: string;
+}
+
+/** `value` as `ImportKeys`, or an error if it is not one. */
+export function parseImportKeys(value: unknown): ImportKeys {
+  const keys = value as Partial<ImportKeys> | null;
+  if (typeof keys !== 'object' || keys === null || typeof keys.nodesKey !== 'string' || typeof keys.linksKey !== 'string' || keys.nodesKey === '' || keys.linksKey === '') throw new Error('Invalid import keys');
+  return { nodesKey: keys.nodesKey, linksKey: keys.linksKey };
+}
+
+/**
+ * The layout last worked out for the network (see renderer/layout.ts), kept in `workspace.json` so that it need not be
+ * worked out again when the workspace is opened. `network` identifies the network it was worked out for (its nodes'
+ * display sizes and its links); the renderer uses it as it is only while that still matches.
+ */
+export interface SavedLayout {
+  network: string;
+  /** The centre of each node's display, by node id, in distance units. */
+  positions: Record<string, { x: number; y: number }>;
+  scale: number;
+  minSpace: number;
+  satisfied: boolean;
+}
+
+/** `value` as a saved layout, its positions cut down to the nodes in `nodeIds`; refused if it is not one. */
+export function parseSavedLayout(value: unknown, nodeIds: Set<string>): SavedLayout {
+  const layout = value as Partial<SavedLayout> | null;
+  const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
+  if (typeof layout !== 'object' || layout === null || typeof layout.network !== 'string' || !finite(layout.scale) || !finite(layout.minSpace) || typeof layout.satisfied !== 'boolean') throw new Error('Invalid layout');
+  if (typeof layout.positions !== 'object' || layout.positions === null || Array.isArray(layout.positions)) throw new Error('Invalid layout');
+  const positions: Record<string, { x: number; y: number }> = {};
+  for (const [id, at] of Object.entries(layout.positions)) {
+    if (!finite(at?.x) || !finite(at?.y)) throw new Error('Invalid layout');
+    if (nodeIds.has(id)) positions[id] = { x: at.x, y: at.y };
+  }
+  return { network: layout.network, positions, scale: layout.scale, minSpace: layout.minSpace, satisfied: layout.satisfied };
 }
 
 export interface WorkspaceState {
@@ -79,6 +135,8 @@ export interface WorkspaceState {
   name?: string;
   nodes: NodeRecord[];
   links: WorkspaceLink[];
+  /** The layout saved in `workspace.json`, if any. */
+  layout?: SavedLayout;
 }
 
 export interface OpenResult {
@@ -114,6 +172,20 @@ async function outsideFile(source: string): Promise<Pick<FileNode, 'filename' | 
   return { filename: basename(source), path: source };
 }
 
+/** An imported field's value as node text: a string (empty as `null`), a number or a boolean as text; anything else is no text. */
+function importedText(value: unknown): string | null {
+  if (typeof value === 'string') return value === '' ? null : value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return null;
+}
+
+/** An imported node's `id`, or a link's `source` or `target`, as a key: a string or a number (as text); anything else is none. */
+function importedKey(value: unknown): string | null {
+  if (typeof value === 'string') return value === '' ? null : value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return null;
+}
+
 async function exists(path: string): Promise<boolean> {
   try {
     await access(path);
@@ -132,12 +204,14 @@ export class Workspace {
   private root: string | undefined;
   private nodes: NodeRecord[] = [];
   private links: WorkspaceLink[] = [];
+  private layout: SavedLayout | undefined;
   private lock: WorkspaceLock | undefined;
 
   constructor(private readonly options: WorkspaceOptions) {}
 
   state(): WorkspaceState {
-    return this.root ? { open: true, name: basename(this.root), nodes: this.nodes, links: this.links } : { open: false, nodes: [], links: [] };
+    if (!this.root) return { open: false, nodes: [], links: [] };
+    return { open: true, name: basename(this.root), nodes: this.nodes, links: this.links, ...(this.layout ? { layout: this.layout } : {}) };
   }
 
   /** The open workspace's folder. */
@@ -165,6 +239,78 @@ export class Workspace {
       }
       await this.saveNodes(root, [...this.nodes, node], copied);
       return { status: 'opened', workspace: this.state() };
+    } catch (error) {
+      return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
+    }
+  }
+
+  /**
+   * Imports the JSON file `file` (an object): a node for each object in the array under its top-level key `nodesKey`,
+   * and a link for each object in the array under `linksKey`. A key the file does not have, or that does not hold an
+   * array, is skipped. Nodes and links are written to `workspace.json` together.
+   *
+   * A node takes its `title`, `description` and `body`, and shows the first of them with text; an object with none is
+   * skipped. A link joins its `source` and `target`, each the `id` of a node in the file (or, failing that, of a node
+   * already in the workspace), and takes its `weight` (1 to 10, else that of a new link) and `description`. A link is
+   * skipped if either end is not found, if both ends are the same node, or if the two nodes are already linked.
+   */
+  async importFile(file: string, { nodesKey, linksKey }: ImportKeys): Promise<OpenResult & { nodes?: number; links?: number }> {
+    try {
+      const root = this.root;
+      if (!root) throw new Error('No workspace is open');
+      let data: unknown;
+      try {
+        data = JSON.parse(await readFile(file, 'utf8'));
+      } catch {
+        throw new Error(`${basename(file)} is not valid JSON`);
+      }
+      if (typeof data !== 'object' || data === null || Array.isArray(data)) throw new Error(`${basename(file)} is not a JSON object`);
+      const source = data as Record<string, unknown>;
+      /** The objects in the array under `key`; none if the file has no such array. */
+      const objects = (key: string) => {
+        const value = Object.hasOwn(source, key) ? source[key] : undefined;
+        return Array.isArray(value) ? value.filter((entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null && !Array.isArray(entry)) : [];
+      };
+
+      const addedAt = new Date().toISOString();
+      const nodes: NodeRecord[] = [];
+      /** The workspace id of each imported node, by its `id` in the file. */
+      const imported = new Map<string, string>();
+      for (const entry of objects(nodesKey)) {
+        const fields = Object.fromEntries(DISPLAY_FIELDS.map((field) => [field, importedText(entry[field])])) as Record<DisplayField, string | null>;
+        const shown = DISPLAY_FIELDS.find((field) => fields[field] !== null);
+        if (!shown) continue;
+        const node: NodeRecord = { id: randomUUID(), addedAt, ...fields, display: [shown] };
+        nodes.push(node);
+        const key = importedKey(entry.id);
+        if (key !== null && !imported.has(key)) imported.set(key, node.id);
+      }
+
+      const existing = new Set(this.nodes.map((node) => node.id));
+      /** The workspace id of a link's end: an imported node's, else a node already in the workspace. */
+      const end = (value: unknown) => {
+        const key = importedKey(value);
+        if (key === null) return undefined;
+        return imported.get(key) ?? (existing.has(key) ? key : undefined);
+      };
+      const links = [...this.links];
+      let linked = 0;
+      for (const entry of objects(linksKey)) {
+        const [from, to] = [end(entry.source), end(entry.target)];
+        if (!from || !to || from === to) continue;
+        if (links.some((link) => (link.source === from && link.target === to) || (link.source === to && link.target === from))) continue;
+        const weight = typeof entry.weight === 'number' && Number.isFinite(entry.weight) && entry.weight >= 1 && entry.weight <= 10 ? entry.weight : NEW_LINK_WEIGHT;
+        links.push({ id: randomUUID(), source: from, target: to, weight, description: importedText(entry.description) });
+        linked += 1;
+      }
+
+      if (nodes.length > 0 || linked > 0) {
+        const allNodes = [...this.nodes, ...nodes];
+        await this.writeEntries(root, { nodes: allNodes, links });
+        this.nodes = allNodes;
+        this.links = links;
+      }
+      return { status: 'opened', workspace: this.state(), nodes: nodes.length, links: linked };
     } catch (error) {
       return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
     }
@@ -229,7 +375,7 @@ export class Workspace {
       if (source === target || ![source, target].every((id) => this.nodes.some((node) => node.id === id))) throw new Error('Not a valid link');
       // Only one link between two nodes, whichever way it points: a duplicate changes nothing, and is no error.
       if (this.links.some((link) => (link.source === source && link.target === target) || (link.source === target && link.target === source))) return { status: 'opened', workspace: this.state() };
-      const links = [...this.links, { id: randomUUID(), source, target, weight: NEW_LINK_WEIGHT }];
+      const links = [...this.links, { id: randomUUID(), source, target, weight: NEW_LINK_WEIGHT, description: null }];
       await this.writeLinks(root, links);
       this.links = links;
       return { status: 'opened', workspace: this.state() };
@@ -238,20 +384,29 @@ export class Workspace {
     }
   }
 
-  /** Sets the weight (a number from 1 to 10) of the link `id` in `workspace.json`. */
-  async setLinkWeight(id: string, weight: number): Promise<OpenResult> {
+  /** Sets the weight (a number from 1 to 10) and the description (empty as `null`) of the link `id` in `workspace.json`. */
+  async updateLink(id: string, { weight, description }: LinkInput): Promise<OpenResult> {
     try {
       const root = this.root;
       if (!root) throw new Error('No workspace is open');
       if (!Number.isFinite(weight) || weight < 1 || weight > 10) throw new Error(`Not a valid weight: ${weight}`);
       if (!this.links.some((link) => link.id === id)) throw new Error('No such link in the workspace');
-      const links = this.links.map((link) => (link.id === id ? { ...link, weight } : link));
+      const links = this.links.map((link) => (link.id === id ? { ...link, weight, description: description || null } : link));
       await this.writeLinks(root, links);
       this.links = links;
       return { status: 'opened', workspace: this.state() };
     } catch (error) {
       return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
     }
+  }
+
+  /** Records `layout` (see SavedLayout) as the `layout` of `workspace.json`, replacing any there. */
+  async saveLayout(layout: unknown): Promise<void> {
+    const root = this.root;
+    if (!root) throw new Error('No workspace is open');
+    const parsed = parseSavedLayout(layout, new Set(this.nodes.map((node) => node.id)));
+    await this.writeEntries(root, { layout: parsed });
+    this.layout = parsed;
   }
 
   /** Copies the file at `source` into the workspace folder, under a free name; resolves with that name. */
@@ -287,6 +442,7 @@ export class Workspace {
     this.root = undefined;
     this.nodes = [];
     this.links = [];
+    this.layout = undefined;
     if (!lock) return;
     await lock.release();
     await this.runHook(() => this.options.onClosed?.());
@@ -300,9 +456,11 @@ export class Workspace {
     const lock = await acquireLock(folder);
     let nodes: NodeRecord[];
     let links: WorkspaceLink[];
+    let layout: SavedLayout | undefined;
     try {
       nodes = await this.loadNodes(folder);
       links = await this.loadLinks(folder);
+      layout = await this.loadLayout(folder, nodes);
     } catch (error) {
       await lock.release();
       throw error;
@@ -312,6 +470,7 @@ export class Workspace {
     this.lock = lock;
     this.nodes = nodes;
     this.links = links;
+    this.layout = layout;
     await this.runHook(() => this.options.onOpened?.(folder));
   }
 
@@ -332,10 +491,25 @@ export class Workspace {
     return [];
   }
 
-  /** Reads the `links` of `workspace.json`; a file without them has no links (they are written with the first link). */
+  /**
+   * Reads the `links` of `workspace.json`; a file without them has no links (they are written with the first link). A
+   * link written before links had descriptions has none (`null`); it is written with one the next time the links are.
+   */
   private async loadLinks(folder: string): Promise<WorkspaceLink[]> {
     const info = await this.readInfo(folder);
-    return Array.isArray(info.links) ? (info.links as WorkspaceLink[]) : [];
+    if (!Array.isArray(info.links)) return [];
+    return (info.links as Partial<WorkspaceLink>[]).map((link) => ({ ...link, description: typeof link.description === 'string' && link.description !== '' ? link.description : null }) as WorkspaceLink);
+  }
+
+  /** Reads the `layout` of `workspace.json`; one that is missing or not valid is no layout (it is worked out afresh). */
+  private async loadLayout(folder: string, nodes: NodeRecord[]): Promise<SavedLayout | undefined> {
+    const info = await this.readInfo(folder);
+    if (info.layout === undefined) return undefined;
+    try {
+      return parseSavedLayout(info.layout, new Set(nodes.map((node) => node.id)));
+    } catch {
+      return undefined;
+    }
   }
 
   private async readInfo(folder: string): Promise<Record<string, unknown>> {
@@ -360,7 +534,7 @@ export class Workspace {
   }
 
   /** Replaces the given entries of `workspace.json`, leaving its others as they are. The file is swapped in whole. */
-  private async writeEntries(folder: string, entries: { nodes?: NodeRecord[]; links?: WorkspaceLink[] }): Promise<void> {
+  private async writeEntries(folder: string, entries: { nodes?: NodeRecord[]; links?: WorkspaceLink[]; layout?: SavedLayout }): Promise<void> {
     const info = { ...(await this.readInfo(folder)), ...entries };
     const file = join(folder, WORKSPACE_FILE);
     const temp = `${file}.${process.pid}.tmp`;

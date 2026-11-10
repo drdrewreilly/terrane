@@ -1,3 +1,4 @@
+import { findClusters, type Clusters } from './clusters';
 import { alignmentCost, countCrossings, DIAGONAL_PENALTY, routeLinks, segmentsCross, type LinkPath, type Point, type Rect } from './paths';
 
 /**
@@ -9,8 +10,13 @@ import { alignmentCost, countCrossings, DIAGONAL_PENALTY, routeLinks, segmentsCr
  *
  * with as few links crossing each other as it can manage while meeting them, and while keeping at least the minimum space between displays (9.4). It is a force simulation written for these goals,
  * starting from the Fruchterman-Reingold algorithm (D4): links pull or push their two displays into their range,
- * displays push away from close neighbours, a weak pull towards the middle keeps the network together, and the
- * temperature (the most a display may move in one step) cools as it runs. A run stops as soon as the goals are met.
+ * displays push away from close neighbours, and the temperature (the most a display may move in one step) cools as it
+ * runs. A run stops as soon as the goals are met.
+ *
+ * There is no pull towards the middle of the canvas. Instead the network is divided into clusters (see clusters.ts):
+ * nodes tied by shared neighbours and high-weight links. Each cluster draws its displays together around those with the
+ * most links within it, clusters push apart where they overlap, and each moves as a whole wherever best meets the goals
+ * (see clusterForces). New displays start cluster by cluster, the most central first.
  *
  * The link distances of every weight are scaled together. The layout tries the starting scale (1) and grows the scale
  * until the goals are met, then narrows down to the smallest scale that still meets them (D13), and ends there.
@@ -25,8 +31,9 @@ import { alignmentCost, countCrossings, DIAGONAL_PENALTY, routeLinks, segmentsCr
  * display where the goals are still met and no more links cross. (Paths support it: a link between displays centred on
  * a horizontal or vertical axis is a straight line between the middles of their facing edges, see shortestLines in paths.ts.)
  *
- * Positions are not saved (D3): each run starts from the positions it is given (those of the previous run) and places
- * displays without one.
+ * Each run starts from the positions it is given (those of the previous run, or those saved in the workspace) and
+ * places displays without one. The canvas saves each run's positions in the workspace (see Canvas.tsx), and on opening
+ * uses them as they are if the network has not changed since, without running the layout at all.
  */
 
 export interface LayoutNode {
@@ -55,7 +62,7 @@ export interface Layout {
 const RANGE_START = 30;
 const RANGE_WIDTH = 30;
 /** The minimum space between displays, at the starting scale (9.4): it grows with the scale, so is never less. */
-const MIN_SPACE = 16;
+export const MIN_SPACE = 16;
 /** Displays closer than this (times the scale) push each other away, leaving room for links to pass between them. */
 const ROOM = 40;
 const GROWTH = 1.5;
@@ -81,6 +88,14 @@ const ALIGN_CHECK = 10;
 const ALIGN_BIAS = 0.1;
 const ALIGN_STEP = 3;
 const ALIGN_PATHS = 300;
+/**
+ * The cluster forces (see clusterForces): the pull of a cluster on its most central display (as a fraction of the way to
+ * the cluster's middle, per step), how hard overlapping clusters push apart (as a fraction of the overlap) and the pull
+ * between unlinked parts of the network.
+ */
+const CLUSTER_PULL = 0.01;
+const CLUSTER_PUSH = 0.1;
+const COMPONENT_PULL = 0.002;
 
 /** The range of link distances for a weight at a scale (9.3): continuous, highest weight shortest, all as wide. */
 export function distanceRange(weight: number, scale: number): [number, number] {
@@ -114,14 +129,14 @@ function centroid(points: Iterable<Point>): Point {
   return n ? { x: x / n, y: y / n } : { x: 0, y: 0 };
 }
 
-/** A starting position for a display that has none: near its linked displays (or the middle), clear of the others. */
-function place(node: LayoutNode, near: Point, placed: { node: LayoutNode; at: Point }[]): Point {
+/** A starting position for a display that has none: the nearest to `near` at least `clearance` from the others. */
+function place(node: LayoutNode, near: Point, placed: { node: LayoutNode; at: Point }[], clearance = ROOM): Point {
   for (let radius = 0; ; radius += 10) {
     const steps = radius === 0 ? 1 : Math.max(8, Math.round((2 * Math.PI * radius) / 20));
     for (let i = 0; i < steps; i += 1) {
       const angle = (2 * Math.PI * i) / steps;
       const at = { x: near.x + radius * Math.cos(angle), y: near.y + radius * Math.sin(angle) };
-      if (placed.every((other) => space(node, at, other.node, other.at) >= ROOM)) return at;
+      if (placed.every((other) => space(node, at, other.node, other.at) >= clearance)) return at;
     }
   }
 }
@@ -129,6 +144,9 @@ function place(node: LayoutNode, near: Point, placed: { node: LayoutNode; at: Po
 interface Network {
   nodes: LayoutNode[];
   links: { link: LayoutLink; a: number; b: number }[];
+  clusters: Clusters;
+  /** The nodes in each connected part of the network. */
+  components: number[][];
 }
 
 interface Trial {
@@ -225,12 +243,7 @@ function advance(network: Network, positions: Point[], scale: number, temperatur
       moves[b].y -= py * bias * 0.5;
     }
   }
-  // A weak pull towards the middle keeps the network together.
-  const middle = centroid(positions);
-  for (let i = 0; i < n; i += 1) {
-    moves[i].x += (middle.x - positions[i].x) * 0.002;
-    moves[i].y += (middle.y - positions[i].y) * 0.002;
-  }
+  clusterForces(network, positions, moves, room);
   for (let i = 0; i < n; i += 1) {
     const length = Math.hypot(moves[i].x, moves[i].y);
     const k = length > temperature ? temperature / length : 1;
@@ -238,6 +251,63 @@ function advance(network: Network, positions: Point[], scale: number, temperatur
     positions[i].y += moves[i].y * k;
   }
   separate(nodes, positions, minSpace);
+}
+
+/**
+ * The forces of the clusters (see clusters.ts), in place of a pull towards the middle of the canvas:
+ *
+ * - each cluster pulls its displays towards its own middle, those with the most links within it the most strongly, so
+ *   they end up nearest its middle and the others around them;
+ * - clusters whose extents (plus the room between displays) overlap push each other apart, each moving as a whole, so
+ *   clusters keep to their own parts of the canvas; where they go is left to the links between them and the other goals;
+ * - parts of the network with no links between them are drawn together, each moving as a whole, just enough to keep
+ *   them from drifting apart.
+ */
+function clusterForces(network: Network, positions: Point[], moves: Point[], room: number): void {
+  const { nodes, clusters, components } = network;
+  const shift = (members: number[], x: number, y: number) => {
+    for (const i of members) {
+      moves[i].x += x;
+      moves[i].y += y;
+    }
+  };
+
+  const extents = clusters.members.map((members) => {
+    const middle = centroid(members.map((i) => positions[i]));
+    const radius = Math.max(...members.map((i) => Math.hypot(positions[i].x - middle.x, positions[i].y - middle.y) + Math.hypot(nodes[i].width, nodes[i].height) / 2));
+    return { members, middle, radius };
+  });
+
+  for (const { members, middle } of extents) {
+    if (members.length < 2) continue;
+    for (const i of members) {
+      const k = CLUSTER_PULL * clusters.centrality[i];
+      moves[i].x += (middle.x - positions[i].x) * k;
+      moves[i].y += (middle.y - positions[i].y) * k;
+    }
+  }
+
+  for (let c = 0; c < extents.length; c += 1) {
+    for (let d = c + 1; d < extents.length; d += 1) {
+      const [p, q] = [extents[c], extents[d]];
+      let [dx, dy] = [q.middle.x - p.middle.x, q.middle.y - p.middle.y];
+      let length = Math.hypot(dx, dy);
+      if (length < 1e-6) [dx, dy, length] = [Math.cos(c + d), Math.sin(c + d), 1];
+      const overlap = p.radius + q.radius + room - length;
+      if (overlap <= 0) continue;
+      const amount = overlap * CLUSTER_PUSH * 0.5;
+      shift(p.members, (-dx / length) * amount, (-dy / length) * amount);
+      shift(q.members, (dx / length) * amount, (dy / length) * amount);
+    }
+  }
+
+  if (components.length > 1) {
+    const middle = centroid(positions);
+    for (const members of components) {
+      const own = centroid(members.map((i) => positions[i]));
+      shift(members, (middle.x - own.x) * COMPONENT_PULL, (middle.y - own.y) * COMPONENT_PULL);
+    }
+  }
 }
 
 /** One run of the simulation at a fixed scale, from the given positions, until the goals are met or it has cooled. */
@@ -499,24 +569,36 @@ function stretch(points: Point[], factor: number): Point[] {
 /** Runs the layout for the network, starting from `previous` positions where it has them. */
 export function runLayout(nodes: LayoutNode[], links: LayoutLink[], previous: Map<string, Point>): Layout {
   const index = new Map(nodes.map((node, i) => [node.id, i]));
-  const network: Network = {
-    nodes,
-    links: links.flatMap((link) => {
-      const a = index.get(link.source);
-      const b = index.get(link.target);
-      return a === undefined || b === undefined || a === b ? [] : [{ link, a, b }];
-    }),
-  };
+  const networkLinks = links.flatMap((link) => {
+    const a = index.get(link.source);
+    const b = index.get(link.target);
+    return a === undefined || b === undefined || a === b ? [] : [{ link, a, b }];
+  });
+  const clusters = findClusters(nodes.length, networkLinks.map(({ link, a, b }) => ({ a, b, weight: link.weight })));
+  const components: number[][] = [];
+  clusters.component.forEach((c, i) => (components[c] ??= []).push(i));
+  const network: Network = { nodes, links: networkLinks, clusters, components };
 
-  // Starting positions: the previous ones, then a place for each display without one.
+  // Starting positions: the previous ones, then a place for each display without one, cluster by cluster and the most
+  // central first, so each cluster grows out from its most central displays. A display goes near its linked displays in
+  // its cluster, or failing those the rest of its cluster; the first of a cluster goes near its linked displays (or the
+  // others), but with room around it for the cluster, so clusters start apart.
   const start: (Point | undefined)[] = nodes.map((node) => previous.get(node.id));
   const placed = nodes.flatMap((node, i) => (start[i] ? [{ node, at: start[i]! }] : []));
-  nodes.forEach((node, i) => {
-    if (start[i]) return;
-    const linked = network.links.flatMap(({ a, b }) => (a === i && start[b] ? [start[b]!] : b === i && start[a] ? [start[a]!] : []));
-    start[i] = place(node, centroid(linked.length ? linked : placed.map((p) => p.at)), placed);
-    placed.push({ node, at: start[i]! });
-  });
+  const order = nodes.map((_, i) => i).sort((i, j) => clusters.of[i] - clusters.of[j] || clusters.centrality[j] - clusters.centrality[i] || i - j);
+  for (const i of order) {
+    if (start[i]) continue;
+    const cluster = clusters.of[i];
+    const linked = network.links.flatMap(({ a, b }) => (a === i && start[b] ? [b] : b === i && start[a] ? [a] : []));
+    const sameCluster = (js: number[]) => js.filter((j) => clusters.of[j] === cluster);
+    const near = sameCluster(linked).length ? sameCluster(linked) : sameCluster(clusters.members[cluster].filter((j) => start[j]));
+    if (near.length) start[i] = place(nodes[i], centroid(near.map((j) => start[j]!)), placed);
+    else {
+      const clearance = ROOM * (1 + Math.sqrt(clusters.members[cluster].length));
+      start[i] = place(nodes[i], centroid(linked.length ? linked.map((j) => start[j]!) : placed.map((p) => p.at)), placed, clearance);
+    }
+    placed.push({ node: nodes[i], at: start[i]! });
+  }
 
   // Grow the scale until the goals are met, then narrow down to the smallest scale that meets them (D13).
   const trials: Trial[] = [];

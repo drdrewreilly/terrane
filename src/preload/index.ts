@@ -11,8 +11,11 @@ contextBridge.exposeInMainWorld('workspaceBridge', {
   current: () => ipcRenderer.invoke('terrane:workspace.current'),
   readNode: (id: string) => ipcRenderer.invoke('terrane:workspace.readNode', id),
   pickFile: () => ipcRenderer.invoke('terrane:workspace.pickFile'),
+  pickImportFile: () => ipcRenderer.invoke('terrane:workspace.pickImportFile'),
+  importFile: (keys: unknown) => ipcRenderer.invoke('terrane:workspace.importFile', keys),
   createNode: (input: unknown) => ipcRenderer.invoke('terrane:workspace.createNode', input),
   updateNode: (id: string, input: unknown) => ipcRenderer.invoke('terrane:workspace.updateNode', id, input),
   createLink: (source: string, target: string) => ipcRenderer.invoke('terrane:workspace.createLink', source, target),
-  setLinkWeight: (id: string, weight: number) => ipcRenderer.invoke('terrane:workspace.setLinkWeight', id, weight),
+  updateLink: (id: string, input: unknown) => ipcRenderer.invoke('terrane:workspace.updateLink', id, input),
+  saveLayout: (layout: unknown) => ipcRenderer.invoke('terrane:workspace.saveLayout', layout),
 });

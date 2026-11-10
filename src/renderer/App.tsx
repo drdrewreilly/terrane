@@ -1,24 +1,37 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ab } from './ab';
 import { Canvas } from './Canvas';
+import { ImportDialog } from './ImportDialog';
+import { LinkDialog, linkChanged } from './LinkDialog';
 import { NewWorkspaceDialog } from './NewWorkspaceDialog';
 import { NodeDialog } from './NodeDialog';
 import { NodeList } from './NodeList';
 import { NodeMenu } from './NodeMenu';
 import { SplitView } from './SplitView';
 import { Toolbar } from './Toolbar';
-import { WeightDialog } from './WeightDialog';
 
 /**
- * A toolbar (new workspace, open workspace, add) above the node list (left) and the canvas, which shows the network of
+ * A toolbar (new workspace, open workspace, add, import) above the node list (left) and the canvas, which shows the network of
  * the nodes that have a link (right), split by a draggable splitter. Right-clicking a node in either opens the node popup. Workspaces are created and opened
  * the framework's way (`ab.workspace`); the main process reopens the last one at startup.
  */
 export function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>();
+  /**
+   * Counts the workspaces opened: the canvas is made afresh for each (and so first shows its network zoomed right out).
+   * An open that leaves the same workspace showing (cancelled, or failed) does not count.
+   */
+  const [opened, setOpened] = useState(0);
+  /** The workspace being shown, as JSON: kept up to date however it changes (an open, or a change to the network). */
+  const shown = useRef<string>(undefined);
+  useEffect(() => {
+    shown.current = JSON.stringify(workspace && { ...workspace, layout: undefined });
+  }, [workspace]);
   const [error, setError] = useState<string>();
   /** The node dialog being shown: for a new node, or for editing `node`. */
   const [dialog, setDialog] = useState<{ kind: 'create' } | { kind: 'edit'; node: NodeRecord }>();
+  /** Whether the import dialog is open. */
+  const [importing, setImporting] = useState(false);
   /** The location the "new workspace" dialog starts with; `null` while the dialog is closed. */
   const [newWorkspaceLocation, setNewWorkspaceLocation] = useState<string | null>(null);
 
@@ -26,7 +39,7 @@ export function App() {
   const [menu, setMenu] = useState<{ source: string; x: number; y: number }>();
   /** The node highlighted on the canvas: the one the pointer is over in the node popup. */
   const [highlighted, setHighlighted] = useState<string>();
-  /** The link just created, whose weight dialog is open. */
+  /** The link just created, whose link dialog is open. */
   const [weighing, setWeighing] = useState<WorkspaceLink>();
   /** The ids of the nodes that have at least one link. */
   const linked = useMemo(() => new Set(workspace?.links.flatMap((link) => [link.source, link.target]) ?? []), [workspace]);
@@ -40,7 +53,16 @@ export function App() {
     setHighlighted(undefined);
   };
 
-  const showWorkspace = useCallback(() => window.workspaceBridge.current().then(setWorkspace), []);
+  const showWorkspace = useCallback(
+    () =>
+      window.workspaceBridge.current().then((next) => {
+        // The saved layout changes as the canvas saves it: it does not make the workspace another one.
+        const json = JSON.stringify({ ...next, layout: undefined });
+        if (json !== shown.current) setOpened((count) => count + 1);
+        setWorkspace(next);
+      }),
+    [],
+  );
 
   const newWorkspace = async () => {
     setError(undefined);
@@ -66,7 +88,7 @@ export function App() {
     return result;
   };
 
-  /** Creates a link and opens the weight dialog for it. */
+  /** Creates a link and opens the link dialog for it. */
   const createLink = async (source: string, target: string) => {
     const before = new Set(workspace?.links.map((link) => link.id));
     const result = await change(() => window.workspaceBridge.createLink(source, target));
@@ -104,7 +126,24 @@ export function App() {
 
   return (
     <div className="flex h-screen flex-col">
-      <Toolbar onNewWorkspace={() => void newWorkspace()} onOpenWorkspace={() => void openWorkspace()} onAdd={() => setDialog({ kind: 'create' })} />
+      <Toolbar
+        onNewWorkspace={() => void newWorkspace()}
+        onOpenWorkspace={() => void openWorkspace()}
+        onAdd={() => setDialog({ kind: 'create' })}
+        onImport={() => {
+          setError(undefined);
+          setImporting(true);
+        }}
+      />
+      {importing && (
+        <ImportDialog
+          onImported={(result) => {
+            setImporting(false);
+            setWorkspace(result.workspace);
+          }}
+          onCancel={() => setImporting(false)}
+        />
+      )}
       {dialog?.kind === 'create' && <NodeDialog onSubmit={(input) => void submit(() => window.workspaceBridge.createNode(input))} onCancel={() => setDialog(undefined)} />}
       {dialog?.kind === 'edit' && (
         <NodeDialog node={dialog.node} onSubmit={(input) => void submit(() => window.workspaceBridge.updateNode(dialog.node.id, input))} onCancel={() => setDialog(undefined)} />
@@ -129,10 +168,13 @@ export function App() {
         second={
           workspace?.open && (
             <Canvas
+              key={opened}
+              saved={workspace.layout}
+              onLayout={(layout) => void window.workspaceBridge.saveLayout(layout).catch(() => undefined)}
               nodes={linkedNodes}
               links={workspace.links}
               onCreateLink={(source, target) => void createLink(source, target)}
-              onSetWeight={(link, weight) => void change(() => window.workspaceBridge.setLinkWeight(link, weight))}
+              onUpdateLink={(link, input) => void change(() => window.workspaceBridge.updateLink(link, input))}
               onOpenNode={openNode}
               onNodeMenu={openMenu}
               highlighted={highlighted}
@@ -157,11 +199,11 @@ export function App() {
         />
       )}
       {weighing && (
-        <WeightDialog
-          weight={weighing.weight}
-          onClose={(weight) => {
+        <LinkDialog
+          link={weighing}
+          onClose={(input) => {
             setWeighing(undefined);
-            if (weight !== weighing.weight) void change(() => window.workspaceBridge.setLinkWeight(weighing.id, weight));
+            if (input && linkChanged(weighing, input)) void change(() => window.workspaceBridge.updateLink(weighing.id, input));
           }}
         />
       )}

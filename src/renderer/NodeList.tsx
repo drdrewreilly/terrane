@@ -42,7 +42,9 @@ export function NodeList({ nodes, linked, onOpenNode, onNodeMenu }: NodeListProp
       <SplitView
         direction="column"
         initialFirst={0}
-        // The unlinked part is as tall as its entries: the splitter sits under the last one (or under the search box if there are none).
+        // The unlinked part starts as tall as its entries: the splitter sits under the last one (or under the search box if
+        // there are none). Dragging it up shows fewer unlinked entries (they scroll) and more linked ones; it cannot be
+        // dragged below the last unlinked entry.
         fitFirst
         first={<ul data-testid="unlinked-nodes">{entries(shown.filter((node) => !linked.has(node.id)))}</ul>}
         second={<ul data-testid="linked-nodes">{entries(shown.filter((node) => linked.has(node.id)))}</ul>}
@@ -52,43 +54,62 @@ export function NodeList({ nodes, linked, onOpenNode, onNodeMenu }: NodeListProp
 }
 
 /**
- * A node's entry: its displayed text on one line, with a toggle arrow on the left that expands the entry to show all of
- * the text, wrapped (and, for an image node whose display shows its image, the image above it).
+ * A node's entry: its displayed text on one line. Clicking it (or Enter or Space while it has focus) expands it to show all
+ * of the text, wrapped (and, for an image node whose display shows its image, the image above it), and below it the node's
+ * properties; clicking it again collapses it. A double-click's two clicks cancel out, so it only opens the node.
  */
 function NodeEntry({ node, onOpenNode, onNodeMenu }: { node: NodeRecord; onOpenNode: NodeListProps['onOpenNode']; onNodeMenu: NodeListProps['onNodeMenu'] }) {
   const [expanded, setExpanded] = useState(false);
   const image = isFileNode(node) && handlerFor(node.filename).id === imageHandler.id && showsImage(node) ? node : undefined;
+  const toggle = () => setExpanded((current) => !current);
 
   return (
     <li
       data-testid="node-entry"
       data-node-id={node.id}
       data-expanded={expanded}
-      className="flex cursor-default items-start gap-1 border-b border-slate-100 px-1 py-0.5 text-sm hover:bg-slate-50"
+      tabIndex={0}
+      aria-expanded={expanded}
+      className="flex cursor-default select-none items-start gap-1 border-b border-slate-100 px-1 py-0.5 text-sm hover:bg-slate-50"
+      onClick={toggle}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
+        event.preventDefault();
+        toggle();
+      }}
       onDoubleClick={() => onOpenNode(node)}
       onContextMenu={(event) => {
         event.preventDefault();
         onNodeMenu(node, event.clientX, event.clientY);
       }}
     >
-      <button
-        type="button"
-        aria-label={expanded ? 'Collapse' : 'Expand'}
-        aria-expanded={expanded}
-        data-testid="node-entry-toggle"
-        className="w-4 shrink-0 text-slate-500"
-        onClick={() => setExpanded(!expanded)}
-        onDoubleClick={(event) => event.stopPropagation()}
-      >
-        {expanded ? '▾' : '▸'}
-      </button>
       <div className="min-w-0 flex-1">
         {expanded && image && <EntryImage node={image} />}
         <div data-testid="node-entry-text" className={expanded ? 'whitespace-pre-line break-words' : 'truncate'}>
           {displayLines(node).join('\n')}
         </div>
+        {expanded && <NodeProperties node={node} />}
       </div>
     </li>
+  );
+}
+
+/** A node's text properties (title, description and body), each labelled; an empty one is shown as a dash. */
+function NodeProperties({ node }: { node: NodeRecord }) {
+  const properties: [string, string | null][] = [
+    ['Title', node.title],
+    ['Description', node.description],
+    ['Body', node.body],
+  ];
+  return (
+    <dl data-testid="node-entry-properties" className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 border-t border-slate-100 pt-1 text-xs">
+      {properties.map(([label, value]) => (
+        <div key={label} data-testid="node-entry-property" data-property={label.toLowerCase()} className="contents">
+          <dt className="text-slate-500">{label}</dt>
+          <dd className={`whitespace-pre-line break-words ${value === null ? 'text-slate-400' : ''}`}>{value ?? '—'}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 

@@ -82,8 +82,8 @@ function entry(page: Page, text: string | RegExp) {
   return page.getByTestId('node-entry').filter({ has: page.getByTestId('node-entry-text').filter({ hasText: pattern }) });
 }
 
-/** Closes the weight dialog that opens when a link is created. */
-async function closeWeightDialog(page: Page): Promise<void> {
+/** Closes the link dialog that opens when a link is created. */
+async function closeLinkDialog(page: Page): Promise<void> {
   await expect(page.getByTestId('weight-dialog')).toBeVisible();
   await page.getByTestId('weight-save').click();
   await expect(page.getByTestId('weight-dialog')).toHaveCount(0);
@@ -91,14 +91,14 @@ async function closeWeightDialog(page: Page): Promise<void> {
 
 /**
  * Links the node whose entry text is `source` to the one whose entry text is `target` with the node popup, closes the
- * weight dialog that opens, and waits for both to be on the canvas.
+ * link dialog that opens, and waits for both to be on the canvas.
  */
 async function link(page: Page, source: string | RegExp, target: string | RegExp): Promise<void> {
   const [sourceId, targetId] = await Promise.all([entry(page, source).getAttribute('data-node-id'), entry(page, target).getAttribute('data-node-id')]);
   await entry(page, source).click({ button: 'right' });
   await page.locator(`[data-testid=node-menu-item][data-node-id="${targetId}"]`).click();
   await expect(page.getByTestId('node-menu')).toHaveCount(0);
-  await closeWeightDialog(page);
+  await closeLinkDialog(page);
   for (const id of [sourceId, targetId]) await expect(page.getByTestId('workspace').locator(`[data-node-id="${id}"]`)).toHaveCount(1);
 }
 
@@ -118,14 +118,14 @@ test.describe('electron shell: workspace', () => {
       const workspace = join(dir, 'My Workspace');
 
       const first = await launch(userData, workspace);
-      // Nothing is asked for: the screen holds only the toolbar (a new-workspace, an open-workspace and an add button, with
+      // Nothing is asked for: the screen holds only the toolbar (a new-workspace, an open-workspace, an add and an import button, with
       // icons and no text), and no workspace is open.
       await expect(first.page.getByTestId('toolbar')).toBeVisible();
       await expect(first.page.getByTestId('workspace')).toHaveCount(0);
       expect((await first.page.locator('body').innerText()).trim()).toBe('');
       await expect(first.page.locator('input, h1, a')).toHaveCount(0);
-      await expect(first.page.locator('[data-testid=toolbar] button')).toHaveCount(3);
-      expect(await first.page.locator('[data-testid=toolbar] button').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('data-testid')))).toEqual(['new-workspace', 'open-workspace', 'add']);
+      await expect(first.page.locator('[data-testid=toolbar] button')).toHaveCount(4);
+      expect(await first.page.locator('[data-testid=toolbar] button').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('data-testid')))).toEqual(['new-workspace', 'open-workspace', 'add', 'import']);
 
       await first.page.getByTestId('open-workspace').click();
       await expect(first.page.getByTestId('workspace')).toBeVisible();
@@ -615,6 +615,222 @@ test.describe('electron shell: workspace', () => {
     });
   });
 
+  test('a workspace opens zoomed right out; the wheel zooms between that and zoom 1; each display shrinks only as far as the minimum space from its neighbours needs, and links keep their width', async () => {
+    await withTemp(async (dir) => {
+      // A chain of nodes long enough not to fit on the canvas at the starting zoom.
+      const folder = join(dir, 'ws');
+      await mkdir(folder);
+      const ids = Array.from({ length: 16 }, (_, i) => `n${i}`);
+      const nodes = ids.map((id) => plain(id, `node ${id}`));
+      const links = ids.slice(1).map((id, i) => ({ id: `link-${id}`, source: ids[i], target: id, weight: 10 }));
+      await writeFile(join(folder, 'workspace.json'), JSON.stringify({ appId: 'terrane', nodes, links }));
+      const { app, page } = await launchOpened(join(dir, 'userData'), folder);
+      try {
+        const canvas = page.getByTestId('workspace');
+        const network = page.getByTestId('network');
+        await expect(page.getByTestId('link')).toHaveCount(links.length);
+        await expect(page.getByTestId('layout-wait')).toHaveCount(0);
+
+        const area = (await canvas.boundingBox())!;
+        const fullSizes = await canvas.locator('[data-node-id]').evaluateAll((elements) => elements.map((element) => (element as HTMLElement).offsetWidth));
+        // On screen: each display's box and the factor it is shrunk by, and the drawn width of each link line.
+        const shown = async () => {
+          const boxes = await canvas.locator('[data-node-id]').evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().toJSON() as DOMRect));
+          const lines = await page.getByTestId('link-line').evaluateAll((paths) =>
+            paths.map((path) => {
+              const m = (path as unknown as SVGGraphicsElement).getScreenCTM()!;
+              return Math.hypot(m.a, m.b) * Number.parseFloat(getComputedStyle(path).strokeWidth);
+            }),
+          );
+          const scales = (await canvas.locator('[data-node-id]').evaluateAll((elements) => elements.map((element) => element.getAttribute('data-scale')))).map(Number);
+          const zoom = Number(await network.getAttribute('data-zoom'));
+          return { boxes, scales, lines, zoom, network: (await network.boundingBox())! };
+        };
+        // A wheel turn, then two frames: the canvas has rendered the new zoom.
+        const wheel = async (deltaY: number) => {
+          await page.mouse.wheel(0, deltaY);
+          await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+        };
+        const gap = (a: DOMRect, b: DOMRect) => Math.max(Math.max(a.left, b.left) - Math.min(a.right, b.right), Math.max(a.top, b.top) - Math.min(a.bottom, b.bottom));
+        // Every display keeps the minimum space (16) from every other, is shown at its own scale, and is shrunk only if it
+        // is at the minimum space from a neighbour: no display is smaller than it needs to be.
+        const spaced = ({ boxes, scales }: { boxes: DOMRect[]; scales: number[] }) => {
+          boxes.forEach((box, i) => {
+            expect(box.width).toBeCloseTo(fullSizes[i] * scales[i], 0);
+            const nearest = Math.min(...boxes.filter((_, j) => j !== i).map((other) => gap(box, other)));
+            expect(nearest).toBeGreaterThanOrEqual(16 - 1);
+            if (scales[i] < 1 - 1e-3) expect(nearest).toBeLessThanOrEqual(16 + 1);
+          });
+        };
+
+        // Opened, the network is zoomed right out and all of it is on the canvas. Links keep their full width, and each
+        // display is shrunk only as far as keeping the minimum space from its neighbours needs.
+        const out = await shown();
+        expect(out.zoom).toBeLessThan(1);
+        expect(out.network.x).toBeGreaterThanOrEqual(area.x - 1);
+        expect(out.network.y).toBeGreaterThanOrEqual(area.y - 1);
+        expect(out.network.x + out.network.width).toBeLessThanOrEqual(area.x + area.width + 1);
+        expect(out.network.y + out.network.height).toBeLessThanOrEqual(area.y + area.height + 1);
+        for (const line of out.lines) expect(line).toBeCloseTo(2, 1);
+        expect(Math.min(...out.scales)).toBeLessThan(1);
+        spaced(out);
+
+        // Down: already as far out as it goes.
+        await page.mouse.move(area.x + area.width / 2, area.y + area.height / 2);
+        await wheel(200);
+        expect(Number(await network.getAttribute('data-zoom'))).toBe(out.zoom);
+
+        // Up a little: the displays grow (or stay at full size), and links keep their width.
+        await wheel(-200);
+        const between = await shown();
+        expect(between.zoom).toBeGreaterThan(out.zoom);
+        between.scales.forEach((scale, i) => expect(scale).toBeGreaterThanOrEqual(out.scales[i] - 1e-6));
+        for (const line of between.lines) expect(line).toBeCloseTo(2, 1);
+        spaced(between);
+
+        // Up, far enough: zoom 1 and no further, every display at its full size.
+        for (let i = 0; i < 20; i++) await wheel(-200);
+        const full = await shown();
+        expect(full.zoom).toBe(1);
+        expect(full.scales.every((scale) => scale === 1)).toBe(true);
+        full.boxes.forEach((box, i) => expect(box.width).toBeCloseTo(fullSizes[i], 0));
+        for (const line of full.lines) expect(line).toBeCloseTo(2, 1);
+        await wheel(-200);
+        expect(Number(await network.getAttribute('data-zoom'))).toBe(1);
+      } finally {
+        await app.close().catch(() => undefined);
+      }
+    });
+  });
+
+  test('zoomed out, leaves (displays with one link) move round the display they are linked to where that lets them stay larger', async () => {
+    await withTemp(async (dir) => {
+      // A hub with five leaves, at the end of a chain long enough to need zooming out.
+      const folder = join(dir, 'ws');
+      await mkdir(folder);
+      const chain = Array.from({ length: 12 }, (_, i) => `c${i}`);
+      const leaves = Array.from({ length: 5 }, (_, i) => `leaf${i}`);
+      const nodes = [...chain, ...leaves].map((id) => plain(id, id));
+      const links = [
+        ...chain.slice(1).map((id, i) => ({ id: `link-${id}`, source: chain[i], target: id, weight: 10 })),
+        ...leaves.map((id) => ({ id: `link-${id}`, source: 'c0', target: id, weight: 5 })),
+      ];
+      await writeFile(join(folder, 'workspace.json'), JSON.stringify({ appId: 'terrane', nodes, links }));
+      const { app, page } = await launchOpened(join(dir, 'userData'), folder);
+      try {
+        const canvas = page.getByTestId('workspace');
+        await expect(page.getByTestId('link')).toHaveCount(links.length);
+        await expect(page.getByTestId('layout-wait')).toHaveCount(0);
+        expect(Number(await page.getByTestId('network').getAttribute('data-zoom'))).toBeLessThan(1);
+
+        // The leaves are at full size, and every display keeps the minimum space from every other.
+        const scales = await Promise.all(leaves.map((id) => canvas.locator(`[data-node-id="${id}"]`).getAttribute('data-scale')));
+        expect(scales.map(Number)).toEqual(leaves.map(() => 1));
+        const boxes = await canvas.locator('[data-node-id]').evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().toJSON() as DOMRect));
+        for (let i = 0; i < boxes.length; i++)
+          for (let j = i + 1; j < boxes.length; j++) {
+            const [a, b] = [boxes[i], boxes[j]];
+            expect(Math.max(Math.max(a.left, b.left) - Math.min(a.right, b.right), Math.max(a.top, b.top) - Math.min(a.bottom, b.bottom))).toBeGreaterThanOrEqual(16 - 1);
+          }
+        // Each leaf's link still joins it to the hub.
+        const hub = (await canvas.locator('[data-node-id="c0"]').boundingBox())!;
+        for (const id of leaves) {
+          const leaf = (await canvas.locator(`[data-node-id="${id}"]`).boundingBox())!;
+          const ends = await page.locator(`[data-link-id="link-${id}"] [data-testid=link-line]`).evaluate((path) => {
+            const svg = path as unknown as SVGGeometryElement;
+            const m = svg.getScreenCTM()!;
+            const at = (l: number) => {
+              const p = svg.getPointAtLength(l);
+              return { x: p.x * m.a + p.y * m.c + m.e, y: p.x * m.b + p.y * m.d + m.f };
+            };
+            return [at(0), at(svg.getTotalLength())];
+          });
+          const onEdge = (p: { x: number; y: number }, r: { x: number; y: number; width: number; height: number }) =>
+            p.x >= r.x - 1.5 && p.x <= r.x + r.width + 1.5 && p.y >= r.y - 1.5 && p.y <= r.y + r.height + 1.5;
+          expect(ends.some((p) => onEdge(p, hub))).toBe(true);
+          expect(ends.some((p) => onEdge(p, leaf))).toBe(true);
+        }
+      } finally {
+        await app.close().catch(() => undefined);
+      }
+    });
+  });
+
+  test('the canvas shows no scrollbars; pressing on empty space shows a grab hand, and dragging pans the network', async () => {
+    await withTemp(async (dir) => {
+      const folder = join(dir, 'ws');
+      await mkdir(folder);
+      const nodes = [plain('one', 'one'), plain('two', 'two')];
+      await writeFile(join(folder, 'workspace.json'), JSON.stringify({ appId: 'terrane', nodes, links: [{ id: 'link-1', source: 'one', target: 'two', weight: 10 }] }));
+      const { app, page } = await launchOpened(join(dir, 'userData'), folder);
+      try {
+        const canvas = page.getByTestId('workspace');
+        const network = page.getByTestId('network');
+        await expect(page.getByTestId('link')).toHaveCount(1);
+        await expect(page.getByTestId('layout-wait')).toHaveCount(0);
+        expect(await canvas.evaluate((element) => getComputedStyle(element).overflow)).toBe('hidden');
+
+        const before = (await network.boundingBox())!;
+        const area = (await canvas.boundingBox())!;
+        // A corner of the canvas, clear of the network.
+        const start = { x: area.x + 5, y: area.y + 5 };
+        await page.mouse.move(start.x, start.y);
+        await page.mouse.down();
+        expect(await canvas.evaluate((element) => getComputedStyle(element).cursor)).toBe('grab');
+        await page.mouse.move(start.x + 40, start.y + 25, { steps: 4 });
+        await page.mouse.up();
+        expect(await canvas.evaluate((element) => getComputedStyle(element).cursor)).not.toBe('grab');
+
+        const after = (await network.boundingBox())!;
+        expect(after.x - before.x).toBeCloseTo(40, 0);
+        expect(after.y - before.y).toBeCloseTo(25, 0);
+      } finally {
+        await app.close().catch(() => undefined);
+      }
+    });
+  });
+
+  test('dragging from a link line selects no text, and a press on empty canvas clears any selection', async () => {
+    await withTemp(async (dir) => {
+      const folder = join(dir, 'ws');
+      await mkdir(folder);
+      const nodes = [plain('one', 'one'), plain('two', 'two')];
+      await writeFile(join(folder, 'workspace.json'), JSON.stringify({ appId: 'terrane', nodes, links: [{ id: 'link-1', source: 'one', target: 'two', weight: 10 }] }));
+      const { app, page } = await launchOpened(join(dir, 'userData'), folder);
+      try {
+        await expect(page.getByTestId('link')).toHaveCount(1);
+        await expect(page.getByTestId('layout-wait')).toHaveCount(0);
+        const selection = () => page.evaluate(() => window.getSelection()?.toString() ?? '');
+
+        // From the middle of the line across the target's display.
+        const middle = await page.getByTestId('link-line').evaluate((path) => {
+          const svg = path as unknown as SVGGeometryElement;
+          const matrix = svg.getScreenCTM()!;
+          const point = svg.getPointAtLength(svg.getTotalLength() / 2);
+          return { x: point.x * matrix.a + point.y * matrix.c + matrix.e, y: point.x * matrix.b + point.y * matrix.d + matrix.f };
+        });
+        const target = (await page.getByTestId('workspace').locator('[data-node-id="two"]').boundingBox())!;
+        await page.mouse.move(middle.x, middle.y);
+        await page.mouse.down();
+        await page.mouse.move(target.x + target.width - 2, target.y + target.height / 2, { steps: 8 });
+        await page.mouse.up();
+        expect(await selection()).toBe('');
+
+        // A selection made some other way is cleared by a press on empty canvas.
+        await page.evaluate(() => {
+          const text = document.querySelector('[data-testid=workspace] [data-node-id="one"]')!;
+          window.getSelection()!.selectAllChildren(text);
+        });
+        expect(await selection()).not.toBe('');
+        const area = (await page.getByTestId('workspace').boundingBox())!;
+        await page.mouse.click(area.x + 5, area.y + 5);
+        expect(await selection()).toBe('');
+      } finally {
+        await app.close().catch(() => undefined);
+      }
+    });
+  });
+
   test('the node list (10% of the width) has a search box above the unlinked nodes and, below a splitter, the linked ones; only linked nodes are on the canvas', async () => {
     await withTemp(async (dir) => {
       const folder = join(dir, 'ws');
@@ -669,22 +885,46 @@ test.describe('electron shell: workspace', () => {
         await expect(linked).toHaveText(['alpha', 'beta']);
         await splitterUnder(page.getByTestId('unlinked-nodes').getByTestId('node-entry').last());
 
-        // An entry is one line, cut off; its toggle expands it to show all of its text, wrapped.
+        // An entry is one line, cut off; clicking it expands it to show all of its text, wrapped, and clicking it again collapses it.
         const longEntry = page.locator('[data-testid=node-entry][data-node-id=d]');
         const text = longEntry.getByTestId('node-entry-text');
         const oneLine = (await text.boundingBox())!.height;
         expect(await text.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
-        await longEntry.getByTestId('node-entry-toggle').click();
+        await longEntry.click();
         await expect(longEntry).toHaveAttribute('data-expanded', 'true');
         expect((await text.boundingBox())!.height).toBeGreaterThan(oneLine * 1.5);
         expect(await text.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
-        await longEntry.getByTestId('node-entry-toggle').click();
+        await longEntry.click();
         await expect(longEntry).toHaveAttribute('data-expanded', 'false');
+
+        // Expanded, an entry also shows the node's properties, each labelled, an empty one as a dash; collapsed, it hides them.
+        const shortEntry = page.locator('[data-testid=node-entry][data-node-id=c]');
+        const properties = shortEntry.getByTestId('node-entry-property');
+        await expect(shortEntry.getByTestId('node-entry-properties')).toHaveCount(0);
+        await shortEntry.click();
+        await expect(properties.locator('dt')).toHaveText(['Title', 'Description', 'Body']);
+        await expect(properties.locator('dd').first()).toHaveText('gamma');
+        await expect(shortEntry.locator('[data-property=description] dd')).toHaveText('—');
+        await splitterUnder(page.getByTestId('unlinked-nodes').getByTestId('node-entry').last()); // the unlinked part grows to fit
+        await shortEntry.click();
+        await expect(shortEntry.getByTestId('node-entry-properties')).toHaveCount(0);
+        // A file node shows the same three properties: not its file or path.
+        const fileEntry = page.locator('[data-testid=node-entry][data-node-id=e]');
+        await fileEntry.click();
+        await expect(fileEntry.getByTestId('node-entry-property').locator('dt')).toHaveText(['Title', 'Description', 'Body']);
+        await fileEntry.click();
+        // The entry has no toggle arrow, and a double-click opens the node without leaving the entry expanded.
+        await expect(shortEntry.locator('button')).toHaveCount(0);
+        await shortEntry.dblclick();
+        await expect(page.getByTestId('node-dialog')).toBeVisible();
+        await expect(shortEntry).toHaveAttribute('data-expanded', 'false');
+        await page.keyboard.press('Escape');
+        await expect(page.getByTestId('node-dialog')).toHaveCount(0);
 
         // An image node's entry shows its image only while expanded.
         const imageEntry = page.locator('[data-testid=node-entry][data-node-id=e]');
         await expect(imageEntry.getByTestId('node-entry-image')).toHaveCount(0);
-        await imageEntry.getByTestId('node-entry-toggle').click();
+        await imageEntry.click();
         await expect.poll(() => imageEntry.locator('img').evaluate((element: HTMLImageElement) => element.complete && element.naturalWidth)).toBe(1);
 
         // Both splitters can be dragged.
@@ -701,6 +941,9 @@ test.describe('electron shell: workspace', () => {
         const betweenBox = (await between.boundingBox())!;
         await drag(between, betweenBox.x + betweenBox.width / 2, betweenBox.y - 50);
         expect(Math.abs((await between.boundingBox())!.y - (betweenBox.y - 50))).toBeLessThan(1);
+        // The splitter between the parts cannot be dragged below the last unlinked entry, so no empty space opens under it.
+        await drag(between, betweenBox.x + betweenBox.width / 2, betweenBox.y + 200);
+        expect(Math.abs((await between.boundingBox())!.y - betweenBox.y)).toBeLessThan(1);
       } finally {
         await app.close().catch(() => undefined);
       }
@@ -751,11 +994,11 @@ test.describe('electron shell: workspace', () => {
         await page.locator('[data-testid=node-entry][data-node-id=c]').click({ button: 'right' });
         await page.locator('[data-testid=node-menu-item][data-node-id=a]').click();
         await expect(menu).toHaveCount(0);
-        await closeWeightDialog(page);
+        await closeLinkDialog(page);
         await expect(page.getByTestId('unlinked-nodes').getByTestId('node-entry-text')).toHaveText([long]);
         await expect(page.getByTestId('linked-nodes').getByTestId('node-entry-text')).toHaveText(['alpha', 'beta', 'gamma']);
         await expect(page.getByTestId('node')).toHaveText(['alpha', 'beta', 'gamma']);
-        await expect.poll(links).toContainEqual(expect.objectContaining({ source: 'c', target: 'a' }));
+        await expect.poll(links).toContainEqual(expect.objectContaining({ source: 'c', target: 'a', weight: 5, description: null }));
 
         // From the canvas: the same popup, without the right-clicked node or the nodes already linked to it, whichever
         // way the link goes (two nodes have at most one link).
@@ -768,6 +1011,214 @@ test.describe('electron shell: workspace', () => {
         expect(await ids()).toEqual(['d']);
         await clickOff();
         await expect(page.getByTestId('link-drag')).toHaveCount(0);
+      } finally {
+        await app.close().catch(() => undefined);
+      }
+    });
+  });
+
+  test('Import opens a dialog that creates nodes and links from the arrays under the nodes and links keys, skipping objects it cannot use and keys the file does not have', async () => {
+    await withTemp(async (dir) => {
+      const workspace = join(dir, 'ws');
+      await mkdir(workspace);
+      // The workspace already holds one node, which imported links can join.
+      await writeFile(join(workspace, 'workspace.json'), JSON.stringify({ appId: 'terrane', nodes: [plain('w', 'existing')], links: [] }));
+      await mkdir(join(dir, 'source'));
+      const source = join(dir, 'source', 'graph.json');
+      await writeFile(
+        source,
+        JSON.stringify({
+          items: [
+            { id: 'a', title: 'Alpha', description: 'first' },
+            { id: 'b', description: 'only described' },
+            { id: 3, body: 'only a body' },
+            { id: 'd', colour: 'red' },
+            { title: '' },
+            'not an object',
+          ],
+          connections: [
+            { source: 'a', target: 'b', weight: 8, description: 'a to b' },
+            { source: 'b', target: 3 }, // no weight: that of a new link
+            { source: 3, target: 'w', weight: 42 }, // to a node already in the workspace; a weight out of range is that of a new link
+            { source: 'b', target: 'a' }, // the two nodes are already linked
+            { source: 'a', target: 'a' }, // the same node at both ends
+            { source: 'a', target: 'd' }, // to a node that was skipped
+            { source: 'a', target: 'nowhere' },
+            { source: 'a' },
+            'not an object',
+          ],
+        }),
+      );
+      const notAnObject = join(dir, 'source', 'list.json');
+      await writeFile(notAnObject, JSON.stringify([{ title: 'x' }]));
+      // The file dialog is answered with the JSON file twice, then with a file that is not a JSON object.
+      const { app, page } = await launchOpened(join(dir, 'userData'), workspace, [source, source, notAnObject]);
+      const info = async () => JSON.parse(await readFile(join(workspace, 'workspace.json'), 'utf8'));
+      const dialog = page.getByTestId('import-dialog');
+      const chooseFile = async (name: string) => {
+        await page.getByTestId('import').click();
+        await expect(dialog).toBeVisible();
+        await expect(dialog.getByTestId('import-submit')).toBeDisabled();
+        await dialog.getByTestId('import-file').click();
+        await expect(dialog.getByTestId('import-path')).toHaveText(name);
+        await expect(dialog.getByTestId('import-submit')).toBeEnabled();
+      };
+      try {
+        // The default keys ("nodes" and "edges") are not in the file: they are skipped without a word, and nothing is created.
+        await chooseFile('graph.json');
+        await expect(dialog.getByTestId('import-nodes')).toHaveAttribute('placeholder', 'nodes');
+        await expect(dialog.getByTestId('import-links')).toHaveAttribute('placeholder', 'edges');
+        await dialog.getByTestId('import-submit').click();
+        await expect(dialog).toHaveCount(0);
+        await expect(page.getByTestId('error')).toHaveCount(0);
+        expect((await info()).nodes).toHaveLength(1);
+
+        // The right keys: a node for each object with text, each showing its first field with text, and a link for each
+        // object whose ends are both found and not yet linked.
+        await chooseFile('graph.json');
+        await dialog.getByTestId('import-nodes').fill('items');
+        await dialog.getByTestId('import-links').fill('connections');
+        await dialog.getByTestId('import-submit').click();
+        await expect(dialog).toHaveCount(0);
+        await expect(page.getByTestId('node-entry-text')).toHaveText(['existing', 'Alpha', 'only described', 'only a body']);
+        const { nodes, links } = await info();
+        expect(nodes).toMatchObject([
+          { id: 'w' },
+          { title: 'Alpha', description: 'first', body: null, display: ['title'] },
+          { title: null, description: 'only described', body: null, display: ['description'] },
+          { title: null, description: null, body: 'only a body', display: ['body'] },
+        ]);
+        const [, alpha, beta, three] = nodes.map((node: { id: string }) => node.id);
+        expect(links).toEqual([
+          { id: expect.any(String), source: alpha, target: beta, weight: 8, description: 'a to b' },
+          { id: expect.any(String), source: beta, target: three, weight: 5, description: null },
+          { id: expect.any(String), source: three, target: 'w', weight: 5, description: null },
+        ]);
+        await expect(page.getByTestId('link')).toHaveCount(3);
+
+        // A file that is not a JSON object cannot be imported: the reason is shown and the dialog stays open.
+        await chooseFile('list.json');
+        await dialog.getByTestId('import-submit').click();
+        await expect(dialog.getByTestId('import-error')).toHaveText('list.json is not a JSON object');
+        await expect(dialog).toBeVisible();
+
+        // Cancel closes the dialog without importing.
+        await dialog.getByTestId('import-cancel').click();
+        await expect(dialog).toHaveCount(0);
+        expect((await info()).nodes).toHaveLength(4);
+      } finally {
+        await app.close();
+      }
+    });
+  });
+
+  test('double-clicking a link opens the link dialog with its weight and description; Save sets both, Cancel changes nothing, and an empty description is stored as null', async () => {
+    await withTemp(async (dir) => {
+      const folder = join(dir, 'ws');
+      await mkdir(folder);
+      // A link written before links had descriptions.
+      await writeFile(join(folder, 'workspace.json'), JSON.stringify({ appId: 'terrane', nodes: [plain('a', 'alpha'), plain('b', 'beta')], links: [{ id: 'ab', source: 'a', target: 'b', weight: 10 }] }));
+      const userData = join(dir, 'userData');
+      const links = async () => JSON.parse(await readFile(join(folder, 'workspace.json'), 'utf8')).links;
+      const dialog = (page: Page) => page.getByTestId('weight-dialog');
+      /** Double-clicks the middle of the link's line. */
+      const openLink = async (page: Page) => {
+        const point = await page.locator('[data-testid=link][data-link-id=ab] [data-testid=link-line]').evaluate((path: SVGPathElement) => {
+          const middle = path.getPointAtLength(path.getTotalLength() / 2).matrixTransform(path.getScreenCTM()!);
+          return { x: middle.x, y: middle.y };
+        });
+        await page.mouse.dblclick(point.x, point.y);
+        await expect(dialog(page)).toBeVisible();
+      };
+
+      const first = await launchOpened(userData, folder);
+      const { page } = first;
+      try {
+        // The link has no description yet: the text area is empty, under its label.
+        await openLink(page);
+        const description = dialog(page).getByLabel('Description');
+        await expect(description).toHaveValue('');
+        await expect(dialog(page).getByTestId('weight-value')).toHaveText('10');
+
+        // Save stores the description with the weight.
+        await description.fill('alpha leads to beta');
+        await dialog(page).getByTestId('weight-save').click();
+        await expect(dialog(page)).toHaveCount(0);
+        await expect.poll(links).toEqual([{ id: 'ab', source: 'a', target: 'b', weight: 10, description: 'alpha leads to beta' }]);
+
+        // Reopened, the dialog shows it; Cancel leaves it as it was.
+        await openLink(page);
+        await expect(description).toHaveValue('alpha leads to beta');
+        await description.fill('something else');
+        await dialog(page).getByTestId('weight-cancel').click();
+        await expect(dialog(page)).toHaveCount(0);
+        expect((await links())[0].description).toBe('alpha leads to beta');
+      } finally {
+        await first.app.close().catch(() => undefined);
+      }
+
+      // The description comes back when the workspace is reopened; emptied and saved, it is stored as null.
+      const second = await launch(userData, join(dir, 'never-picked'));
+      try {
+        await openLink(second.page);
+        const description = dialog(second.page).getByLabel('Description');
+        await expect(description).toHaveValue('alpha leads to beta');
+        await description.fill('');
+        await dialog(second.page).getByTestId('weight-save').click();
+        await expect.poll(links).toEqual([{ id: 'ab', source: 'a', target: 'b', weight: 10, description: null }]);
+      } finally {
+        await second.app.close().catch(() => undefined);
+      }
+    });
+  });
+
+  test('the layout is saved in workspace.json and used as it is when the workspace is opened again, until the network changes', async () => {
+    await withTemp(async (dir) => {
+      const folder = join(dir, 'ws');
+      await mkdir(folder);
+      const nodes = ['a', 'b', 'c', 'd'].map((id) => plain(id, id));
+      const links = [
+        { id: 'ab', source: 'a', target: 'b', weight: 10 },
+        { id: 'bc', source: 'b', target: 'c', weight: 5 },
+        { id: 'cd', source: 'c', target: 'd', weight: 3 },
+      ];
+      await writeFile(join(folder, 'workspace.json'), JSON.stringify({ appId: 'terrane', title: 'mine', nodes, links }));
+      const saved = async () => JSON.parse(await readFile(join(folder, 'workspace.json'), 'utf8'));
+      const userData = join(dir, 'userData');
+
+      // First opened: the layout runs, and is saved with a position for every node; the file's other entries are kept.
+      let { app, page } = await launchOpened(userData, folder);
+      await expect(page.getByTestId('network')).toHaveAttribute('data-layout', 'run');
+      await expect.poll(async () => Object.keys((await saved()).layout?.positions ?? {}).sort()).toEqual(['a', 'b', 'c', 'd']);
+      const first = await saved();
+      expect(first.title).toBe('mine');
+      expect(first.layout).toMatchObject({ network: expect.any(String), scale: expect.any(Number), minSpace: expect.any(Number), satisfied: expect.any(Boolean) });
+      const shown = async () => page.getByTestId('workspace').locator('[data-node-id]').evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().toJSON()));
+      const before = await shown();
+      await app.close();
+
+      // Opened again: the saved layout is used as it is (the layout does not run), and shows the same.
+      ({ app, page } = await launchOpened(userData, folder));
+      try {
+        await expect(page.getByTestId('network')).toHaveAttribute('data-layout', 'saved');
+        // The same, but for the rounding of the saved positions (to hundredths).
+        const after = await shown();
+        expect(after).toHaveLength(before.length);
+        after.forEach((box, i) => {
+          expect(Math.abs(box.x - before[i].x)).toBeLessThan(0.5);
+          expect(Math.abs(box.y - before[i].y)).toBeLessThan(0.5);
+        });
+      } finally {
+        await app.close().catch(() => undefined);
+      }
+      expect((await saved()).layout).toEqual(first.layout);
+
+      // Changed while closed: the saved layout is for another network, so the layout runs (from the saved positions) and is saved again.
+      await writeFile(join(folder, 'workspace.json'), JSON.stringify({ ...first, links: [...links, { id: 'da', source: 'd', target: 'a', weight: 8 }] }));
+      ({ app, page } = await launchOpened(userData, folder));
+      try {
+        await expect(page.getByTestId('network')).toHaveAttribute('data-layout', 'run');
+        await expect.poll(async () => (await saved()).layout.network).not.toBe(first.layout.network);
       } finally {
         await app.close().catch(() => undefined);
       }
@@ -853,7 +1304,7 @@ test.describe('electron shell: security', () => {
         protocol: location.protocol,
       }));
       expect(exposed).toMatchObject({ require: 'undefined', process: 'undefined', buffer: 'undefined', electron: 'undefined', isolated: true, protocol: 'app:' });
-      expect(exposed.workspaceBridge).toEqual(['createLink', 'createNode', 'current', 'pickFile', 'readNode', 'setLinkWeight', 'updateNode']);
+      expect(exposed.workspaceBridge).toEqual(['createLink', 'createNode', 'current', 'importFile', 'pickFile', 'pickImportFile', 'readNode', 'saveLayout', 'updateLink', 'updateNode']);
       expect(exposed.groups).toEqual(['app', 'credentials', 'data', 'net', 'sidecar', 'workspace']);
       await app.close();
     });
