@@ -1,28 +1,15 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent, type WheelEvent } from 'react';
 import { renderNode } from './handlers';
-import { runLayout, type Layout } from './layout';
+import { LAYOUT_ALGORITHM, runLayout, type Layout } from './layout';
 import { LinkDisplay } from './LinkDisplay';
-import { LINE_WIDTH, type Anchor, type Rect } from './paths';
-import { bounds, extentAt, fitZoom, viewAt, type Placed } from './view';
+import { LINE_WIDTH, type Rect } from './paths';
+import { bounds, extentAt, furthestZoom, viewAt, type Placed } from './view';
 import { LinkDialog, linkChanged } from './LinkDialog';
 
-/** Pixels per distance unit: the scale the layout's coordinate space is shown at (9.5). */
-const UNIT_PX = 1;
 /** Space (in pixels) between the displays and the edges of the canvas. */
 const MARGIN = 16;
 /** How much a wheel turn zooms: the zoom changes by a factor of e for each ZOOM_RATE pixels of wheel delta. */
 const ZOOM_RATE = 500;
-
-const CONNECTION_POINTS: { anchor: Anchor; style: CSSProperties }[] = [
-  { anchor: 'top', style: { left: '50%', top: 0 } },
-  { anchor: 'top-right', style: { left: '100%', top: 0 } },
-  { anchor: 'right', style: { left: '100%', top: '50%' } },
-  { anchor: 'bottom-right', style: { left: '100%', top: '100%' } },
-  { anchor: 'bottom', style: { left: '50%', top: '100%' } },
-  { anchor: 'bottom-left', style: { left: 0, top: '100%' } },
-  { anchor: 'left', style: { left: 0, top: '50%' } },
-  { anchor: 'top-left', style: { left: 0, top: 0 } },
-];
 
 /** A short, stable hash of `text` (cyrb53), as hex: identifies the network a saved layout was worked out for. */
 function hash(text: string): string {
@@ -59,47 +46,65 @@ interface CanvasProps {
   saved?: SavedLayout;
   /** A layout has been worked out (not taken from `saved`), to be saved. */
   onLayout?: (layout: SavedLayout) => void;
+  /**
+   * How many times the network has been asked to be laid out from scratch (the toolbar's button). Each time it goes up,
+   * the layout runs with no starting positions: neither the current ones nor those saved.
+   */
+  relayouts?: number;
   nodes: NodeRecord[];
   links: WorkspaceLink[];
+  /** The background colour of each node's display (that of its type), by node id; white if absent. */
+  colours?: Map<string, string>;
   onCreateLink: (source: string, target: string) => void;
   /** The user saved the link dialog with a changed weight or description. */
   onUpdateLink: (link: string, input: LinkInput) => void;
+  /** The user pressed Delete in the link dialog. */
+  onDeleteLink: (link: string) => void;
+  /** The user right-clicked a link's line, at (`x`, `y`) in the window. */
+  onLinkMenu: (link: WorkspaceLink, x: number, y: number) => void;
   /** The user double-clicked a node's display. */
   onOpenNode: (node: NodeRecord) => void;
   /** The user right-clicked a node's display, at (`x`, `y`) in the window. */
   onNodeMenu: (node: NodeRecord, x: number, y: number) => void;
   /** The node whose display is highlighted, if any. */
   highlighted?: string;
+  /** The user right-clicked an empty part of the canvas, at (`x`, `y`) in the window. */
+  onCanvasMenu?: (x: number, y: number) => void;
 }
 
 /**
- * The canvas (PRD 9.5): the layout's coordinate space, shown at UNIT_PX pixels per distance unit, with each node's
- * display where the layout puts it and each link's display along its path. The canvas never scrolls (and never shows
+ * The canvas: each node's display where the layout puts it (see layout.ts) and each link's display along its path. The canvas never scrolls (and never shows
  * scrollbars): pressing the primary button on an empty part of it shows a grab hand, and dragging moves (pans) the
  * network. The network is centred on the canvas, and each time the layout settles it is centred again.
  *
  * Over the canvas, turning the mouse wheel down zooms out and turning it up zooms in, about the point under the pointer.
- * Zooming out brings the displays closer together; they keep their full size (and their text its size) unless the
- * layout's rules call for them to shrink (see view.ts), and links keep their width. The view at
- * zoom 1 is as far in as it goes; as far out as it goes is the first zoom at which the whole network fits on the
- * canvas. Zooming out keeps the network within reach: it never leaves the network further out of view than it needs
+ * Zooming out brings the displays' centres closer together. Displays keep their full size (their size at zoom 1)
+ * except where that would break R1, and then shrink only as far as R1 needs; links keep their width (see view.ts). The
+ * view at zoom 1 is as far in as it goes; as far out as it goes is the first zoom at which the whole network fits on the
+ * canvas (or, if sooner, where R1 would need displays smaller than view.ts allows). Zooming out keeps the network within reach: it never leaves the network further out of view than it needs
  * to, so at the furthest zoom the whole network is in view. A workspace opens zoomed right out.
  *
- * The layout runs whenever the network changes, starting from the positions of the previous run (or, on opening, of the
- * layout saved in the workspace), and each run is saved in the workspace. On opening, a saved layout worked out for the
+ * The layout runs whenever the network changes, and each run is saved in the workspace. After a node or a link is added
+ * or deleted, and whenever `relayouts` goes up, it runs from scratch (with no starting positions); after any other change
+ * (a link's weight, or a display's size), and on opening, it starts from the positions of the previous run (or, on
+ * opening, of the layout saved in the workspace). On opening, a saved layout worked out for the
  * same network (the same nodes, at the same display sizes, and the same links) is used as it is, and the layout does not
  * run. While a layout is pending, a spinner shows in the centre of the canvas. Pressing on a display and dragging shows a line from the pressed point to the pointer, and
  * releasing over another node's display creates a link from the first node (the source) to the other (the target);
- * releasing over the source's own display, or over no display, creates nothing. Hovering over a display shows its eight
- * connection points (its edges' midpoints and its corners), which for now do nothing: a press on one starts no
- * drag.
+ * releasing over the source's own display, or over no display, creates nothing. Right-clicking a display, a link's
+ * line, or an empty part of the canvas asks for its popup (see NodeMenu, LinkMenu and CanvasMenu). Each display's
+ * background is the colour of its node's type.
  */
-export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLink, onOpenNode, onNodeMenu, highlighted }: CanvasProps) {
+export function Canvas({ saved, onLayout, relayouts = 0, nodes, links, colours, onCreateLink, onUpdateLink, onDeleteLink, onLinkMenu, onOpenNode, onNodeMenu, highlighted, onCanvasMenu }: CanvasProps) {
   const elements = useRef(new Map<string, HTMLDivElement>());
   const [sizes, setSizes] = useState(new Map<string, Size>());
   const [layout, setLayout] = useState<Layout>();
-  /** The network (see `network` below) the current layout was run for. */
+  /** The network (see `network` below), and the count of requests to lay it out from scratch, the current layout is for. */
   const [laidOut, setLaidOut] = useState<string>();
+  /** The count of requests to lay out from scratch that has been acted on. */
+  const relaidOut = useRef(relayouts);
+  /** The nodes and links (see `shape` below) the current layout is for: none until there is a layout. */
+  const shaped = useRef<string>(undefined);
   /** Where the current layout came from: the workspace's saved layout, or a run of the layout. */
   const [source, setSource] = useState<'saved' | 'run'>();
   const [selected, setSelected] = useState<string>();
@@ -135,13 +140,20 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
   });
 
   const network = JSON.stringify([nodes.map((node) => [node.id, sizes.get(node.id)]), links.map((link) => [link.id, link.source, link.target, link.weight])]);
+  const request = `${relayouts} ${network}`;
+  /** Which nodes and links the network has (not their sizes or weights): when it changes, a node or link was added or deleted. */
+  const shape = JSON.stringify([nodes.map((node) => node.id).sort(), links.map((link) => link.id).sort()]);
   useEffect(() => {
     if (nodes.some((node) => !sizes.has(node.id))) return;
+    // From scratch when asked to, or when a node or link has been added or deleted since the current layout.
+    const fromScratch = relayouts !== relaidOut.current || (shaped.current !== undefined && shaped.current !== shape);
     // The layout saved for this network (on opening the workspace, before any other has been worked out) is used as it is.
-    const key = hash(network);
-    if (!layout && saved?.network === key && nodes.every((node) => saved.positions[node.id])) {
-      setLayout({ positions: new Map(Object.entries(saved.positions)), scale: saved.scale, minSpace: saved.minSpace, satisfied: saved.satisfied });
-      setLaidOut(network);
+    // The key names the algorithm too, so a layout saved by an earlier one is worked out afresh.
+    const key = hash(LAYOUT_ALGORITHM + network);
+    if (!fromScratch && !layout && saved?.network === key && nodes.every((node) => saved.positions[node.id])) {
+      setLayout({ positions: new Map(Object.entries(saved.positions)), satisfied: saved.satisfied });
+      shaped.current = shape;
+      setLaidOut(request);
       setSource('saved');
       return;
     }
@@ -150,25 +162,27 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
     let timer: number | undefined;
     const frame = requestAnimationFrame(() => {
       timer = window.setTimeout(() => {
-        const units = nodes.map((node) => ({ id: node.id, width: sizes.get(node.id)!.width / UNIT_PX, height: sizes.get(node.id)!.height / UNIT_PX }));
-        // Starting from the positions of the last layout: this canvas's, or else the one saved.
-        const start = layout?.positions ?? new Map(Object.entries(saved?.positions ?? {}));
+        const units = nodes.map((node) => ({ id: node.id, width: sizes.get(node.id)!.width, height: sizes.get(node.id)!.height }));
+        // Starting from the positions of the last layout (this canvas's, or else the one saved), or from none.
+        const start = fromScratch ? new Map<string, Point>() : (layout?.positions ?? new Map(Object.entries(saved?.positions ?? {})));
         const next = runLayout(units, links, start);
+        relaidOut.current = relayouts;
+        shaped.current = shape;
         setLayout(next);
-        setLaidOut(network);
+        setLaidOut(request);
         setSource('run');
         const round = (n: number) => Math.round(n * 100) / 100;
         const positions = Object.fromEntries([...next.positions].map(([id, at]) => [id, { x: round(at.x), y: round(at.y) }]));
-        if (nodes.length > 0) onLayout?.({ network: key, positions, scale: next.scale, minSpace: next.minSpace, satisfied: next.satisfied });
+        if (nodes.length > 0) onLayout?.({ network: key, positions, satisfied: next.satisfied });
       });
     });
     return () => {
       cancelAnimationFrame(frame);
       window.clearTimeout(timer);
     };
-    // `network` stands for nodes, links and sizes: the layout runs only when one of them changes.
-  }, [network]);
-  const waiting = laidOut !== network;
+    // `request` stands for nodes, links, sizes and requests to lay out from scratch: the layout runs only when one changes.
+  }, [request]);
+  const waiting = laidOut !== request;
 
   // Every display the layout has placed: its centre (in pixels, at zoom 1) and its full size.
   const placed = useMemo<Placed[]>(() => {
@@ -176,7 +190,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
     for (const node of nodes) {
       const at = layout?.positions.get(node.id);
       const size = sizes.get(node.id);
-      if (at && size) placed.push({ id: node.id, x: at.x * UNIT_PX, y: at.y * UNIT_PX, ...size });
+      if (at && size) placed.push({ id: node.id, x: at.x, y: at.y, ...size });
     }
     return placed;
   }, [nodes, sizes, layout]);
@@ -184,12 +198,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
     const ids = new Set(placed.map((p) => p.id));
     return links.filter((link) => link.source !== link.target && ids.has(link.source) && ids.has(link.target));
   }, [links, placed]);
-  // The links with a clear path at zoom 1: at every other zoom, the displays shrink as far as they must to keep them clear.
-  const clear = useMemo(() => {
-    const full = viewAt(placed, routable, 1);
-    return new Set([...full.paths].filter(([, path]) => path.clear).map(([id]) => id));
-  }, [placed, routable]);
-  const view = useMemo(() => viewAt(placed, routable, zoom, zoom < 1 ? clear : undefined), [placed, routable, zoom, clear]);
+  const view = useMemo(() => viewAt(placed, routable, zoom), [placed, routable, zoom]);
   const { rects, paths } = view;
 
   // The content takes in every display and every link's path (a curve can bow out beyond the displays), in pixels from
@@ -207,7 +216,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
     const [width, height] = [element.clientWidth, element.clientHeight];
     const cached = fitCache.current;
     if (cached?.placed === placed && cached.width === width && cached.height === height) return cached.zoom;
-    const zoom = fitZoom(placed, routable, width, height, MARGIN);
+    const zoom = furthestZoom(placed, routable, width, height, MARGIN);
     fitCache.current = { placed, width, height, zoom };
     return zoom;
   };
@@ -224,7 +233,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
     setZoom(next);
     centring.current = next;
   }, [layout]);
-  // The network's box need not be centred on its anchor (leaves can move to one side of it), so it is the box that is centred.
+  // The network's box (displays and paths) need not be centred on the middle of the displays' centres, so it is the box that is centred.
   useLayoutEffect(() => {
     if (centring.current === undefined || centring.current !== zoom) return;
     centring.current = undefined;
@@ -247,7 +256,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
     const turned = wheeled.current;
     wheeled.current = undefined;
     if (!element || !turned) return;
-    const { zoom, pan, fit, placed, routable } = latest.current;
+    const { zoom, pan, fit, placed } = latest.current;
     const next = Math.min(1, Math.max(fit(), zoom * Math.exp(-turned.deltaY / ZOOM_RATE)));
     if (next === zoom) return;
     fitting.current = false;
@@ -260,7 +269,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
     if (next < zoom) {
       // Zooming out, the network stays as much in view as it can: wholly inside the canvas along an axis where it is
       // smaller than the canvas, covering it along one where it is larger.
-      const extent = extentAt(placed, routable, next, MARGIN);
+      const extent = extentAt(placed, next, MARGIN);
       const clamp = (value: number, canvasSize: number, start: number, size: number) => {
         const bound = Math.abs(canvasSize - size) / 2;
         const middle = start + size / 2;
@@ -324,6 +333,12 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
         }}
         onPointerUp={() => setPanning(undefined)}
         onPointerCancel={() => setPanning(undefined)}
+        // A right-click on the background (not a display or a link) asks for the canvas popup.
+        onContextMenu={(event) => {
+          if (event.target !== canvas.current && event.target !== content.current) return;
+          event.preventDefault();
+          onCanvasMenu?.(event.clientX, event.clientY);
+        }}
         onWheel={onWheel}
       >
         {/* The network's anchor at the centre of the canvas, moved by the pan. Nothing is scaled: the view is worked out in pixels. */}
@@ -339,7 +354,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
             <g transform={`translate(${-box.x} ${-box.y})`}>
               {links.map((link) => {
                 const path = paths.get(link.id);
-                return path ? <LinkDisplay key={link.id} id={link.id} d={path.d} selected={selected === link.id} onSelect={() => setSelected(link.id)} onEdit={() => setEditing(link)} /> : null;
+                return path ? <LinkDisplay key={link.id} id={link.id} d={path.d} selected={selected === link.id} onSelect={() => setSelected(link.id)} onEdit={() => setEditing(link)} onMenu={(x, y) => onLinkMenu(link, x, y)} /> : null;
               })}
             </g>
           </svg>
@@ -357,33 +372,23 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
                 data-node-id={node.id}
                 data-scale={scale}
                 data-highlighted={highlighted === node.id}
-                className={`group absolute rounded ${highlighted === node.id ? 'outline-2 outline-offset-2 outline-blue-600' : ''}`}
+                className={`absolute rounded ${highlighted === node.id ? 'outline-2 outline-offset-2 outline-blue-600' : ''}`}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   onNodeMenu(node, event.clientX, event.clientY);
                 }}
-                onDoubleClick={(event) => {
-                  if (!(event.target as Element).closest('[data-testid=connection-point]')) onOpenNode(node);
+                onDoubleClick={() => onOpenNode(node)}
+                // Laid out at its full size (so that is what is measured), and shown at its view's factor about its centre.
+                style={{
+                  ...(rect && size ? { ...toPx(rect, size), transform: scale < 1 ? `scale(${scale})` : undefined } : { left: 0, top: 0, visibility: 'hidden' }),
+                  ...(colours?.has(node.id) ? { '--node-colour': colours.get(node.id) } : {}),
                 }}
-                // Positioned at full size and shrunk about its centre: its measured size stays its full size.
-                style={rect && size ? { ...toPx(rect, size), transform: scale < 1 ? `scale(${scale})` : undefined } : { left: 0, top: 0, visibility: 'hidden' }}
                 onPointerDown={(event) => startDrag(event, node.id)}
                 onPointerMove={moveDrag}
                 onPointerUp={endDrag}
                 onPointerCancel={() => setDrag(undefined)}
               >
                 {renderNode(node)}
-                {CONNECTION_POINTS.map(({ anchor, style }) => (
-                  <span
-                    key={anchor}
-                    data-testid="connection-point"
-                    data-anchor={anchor}
-                    className="invisible absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 cursor-crosshair touch-none rounded-full border border-slate-700 bg-white group-hover:visible"
-                    style={style}
-                    // The connection points do nothing for now: a press on one does not reach the display's own handlers.
-                    onPointerDown={(event) => event.stopPropagation()}
-                  />
-                ))}
               </div>
             );
           })}
@@ -401,6 +406,7 @@ export function Canvas({ saved, onLayout, nodes, links, onCreateLink, onUpdateLi
               setEditing(undefined);
               if (input && linkChanged(editing, input)) onUpdateLink(editing.id, input);
             }}
+            onDelete={() => onDeleteLink(editing.id)}
           />
         )}
       </main>

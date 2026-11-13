@@ -74,7 +74,7 @@ export function DefaultRect({ handler, className = '', children }: { handler: st
       ref={element}
       data-testid="node"
       data-handler={handler}
-      className={`flex flex-col items-center justify-center overflow-hidden break-words rounded border border-slate-300 bg-white p-1 text-center text-sm ${className}`}
+      className={`flex flex-col items-center justify-center overflow-hidden break-words rounded border border-slate-300 bg-[var(--node-colour,#ffffff)] p-1 text-center text-sm ${className}`}
       style={size}
     >
       {children}

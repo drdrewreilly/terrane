@@ -1,18 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ab } from './ab';
 import { Canvas } from './Canvas';
+import { CanvasMenu } from './CanvasMenu';
 import { ImportDialog } from './ImportDialog';
 import { LinkDialog, linkChanged } from './LinkDialog';
+import { LinkList } from './LinkList';
+import { LinkMenu } from './LinkMenu';
 import { NewWorkspaceDialog } from './NewWorkspaceDialog';
-import { NodeDialog } from './NodeDialog';
+import { hasCopiedFile, KeepCopyDialog, NodeDialog } from './NodeDialog';
 import { NodeList } from './NodeList';
-import { NodeMenu } from './NodeMenu';
+import { linkTargets, NodeMenu } from './NodeMenu';
+import { NodeTypeManager, typeOf } from './NodeTypes';
 import { SplitView } from './SplitView';
 import { Toolbar } from './Toolbar';
 
 /**
- * A toolbar (new workspace, open workspace, add, import) above the node list (left) and the canvas, which shows the network of
- * the nodes that have a link (right), split by a draggable splitter. Right-clicking a node in either opens the node popup. Workspaces are created and opened
+ * A toolbar (new workspace, open workspace, add, import, relayout, node types) above the node list (left), the canvas, which
+ * shows the network of the nodes that have a link (centre), and the link list (right), each split from the next by a
+ * draggable splitter. Right-clicking a node in either opens the node popup, and
+ * right-clicking a link on the canvas opens the link popup, and right-clicking an empty part of the canvas opens the canvas popup. Workspaces are created and opened
  * the framework's way (`ab.workspace`); the main process reopens the last one at startup.
  */
 export function App() {
@@ -30,8 +36,12 @@ export function App() {
   const [error, setError] = useState<string>();
   /** The node dialog being shown: for a new node, or for editing `node`. */
   const [dialog, setDialog] = useState<{ kind: 'create' } | { kind: 'edit'; node: NodeRecord }>();
+  /** Whether the node type manager is open. */
+  const [managingTypes, setManagingTypes] = useState(false);
   /** Whether the import dialog is open. */
   const [importing, setImporting] = useState(false);
+  /** How many times the toolbar's button has asked for the network to be laid out from scratch (see Canvas). */
+  const [relayouts, setRelayouts] = useState(0);
   /** The location the "new workspace" dialog starts with; `null` while the dialog is closed. */
   const [newWorkspaceLocation, setNewWorkspaceLocation] = useState<string | null>(null);
 
@@ -39,12 +49,20 @@ export function App() {
   const [menu, setMenu] = useState<{ source: string; x: number; y: number }>();
   /** The node highlighted on the canvas: the one the pointer is over in the node popup. */
   const [highlighted, setHighlighted] = useState<string>();
-  /** The link just created, whose link dialog is open. */
+  /** The link whose link dialog is open: one just created, or one double-clicked in the link list. */
   const [weighing, setWeighing] = useState<WorkspaceLink>();
+  /** The canvas popup being shown: for a right-click on an empty part of the canvas, at (`x`, `y`) in the window. */
+  const [canvasMenu, setCanvasMenu] = useState<{ x: number; y: number }>();
+  /** The link popup being shown: for the link right-clicked, at (`x`, `y`) in the window. */
+  const [linkMenu, setLinkMenu] = useState<{ link: string; x: number; y: number }>();
+  /** The node being deleted whose file was copied into the workspace, while asking whether to keep the copy. */
+  const [deleting, setDeleting] = useState<NodeRecord>();
   /** The ids of the nodes that have at least one link. */
   const linked = useMemo(() => new Set(workspace?.links.flatMap((link) => [link.source, link.target]) ?? []), [workspace]);
   /** The nodes shown on the canvas: only those with a link (the others are only in the node list). */
   const linkedNodes = useMemo(() => workspace?.nodes.filter((node) => linked.has(node.id)) ?? [], [workspace, linked]);
+  /** The background colour of each node's display: that of its type. */
+  const colours = useMemo(() => new Map(workspace?.nodes.map((node) => [node.id, typeOf(node, workspace.nodeTypes)?.colour ?? '#ffffff']) ?? []), [workspace]);
 
   const openNode = (node: NodeRecord) => setDialog({ kind: 'edit', node });
   const openMenu = (node: NodeRecord, x: number, y: number) => setMenu({ source: node.id, x, y });
@@ -96,10 +114,36 @@ export function App() {
     if (created) setWeighing(created);
   };
 
-  /** Closes the node dialog and runs the change it asked for. */
-  const submit = async (action: () => Promise<WorkspaceResult>) => {
+  /**
+   * Deletes a node (from the node popup or the node dialog), first asking whether to keep its file if that was copied into
+   * the workspace. Its links go with it, so any node left without a link moves to the node list's unlinked part and off
+   * the canvas.
+   */
+  const deleteNode = (node: NodeRecord, keepCopy?: boolean) => {
+    if (keepCopy === undefined && hasCopiedFile(node)) {
+      setDeleting(node);
+      return;
+    }
+    setDeleting(undefined);
+    setDialog((current) => (current?.kind === 'edit' && current.node.id === node.id ? undefined : current));
+    setHighlighted(undefined);
+    void change(() => window.workspaceBridge.deleteNode(node.id, keepCopy));
+  };
+
+  /** Deletes a link (from the link popup or a link dialog); a node it leaves without a link moves to the unlinked part. */
+  const deleteLink = (id: string) => void change(() => window.workspaceBridge.deleteLink(id));
+
+  /**
+   * Closes the node dialog and runs the change it asked for; then, if a node was chosen under "Link to...", links the
+   * node (`source`, or for a new node the one just created) to it, which opens the link dialog as any new link does.
+   */
+  const submit = async (action: () => Promise<WorkspaceResult>, linkTo?: string, source?: string) => {
     setDialog(undefined);
-    await change(action);
+    const before = new Set(workspace?.nodes.map((node) => node.id));
+    const result = await change(action);
+    if (!linkTo || result.status === 'failed') return;
+    const from = source ?? result.workspace.nodes.find((node) => !before.has(node.id))?.id;
+    if (from) await createLink(from, linkTo);
   };
 
   useEffect(() => {
@@ -134,7 +178,22 @@ export function App() {
           setError(undefined);
           setImporting(true);
         }}
+        onRelayout={() => setRelayouts((count) => count + 1)}
+        onNodeTypes={() => {
+          setError(undefined);
+          if (workspace?.open) setManagingTypes(true);
+        }}
       />
+      {managingTypes && workspace?.open && (
+        <NodeTypeManager
+          nodeTypes={workspace.nodeTypes}
+          nodes={workspace.nodes}
+          onCreate={(input) => change(() => window.workspaceBridge.createNodeType(input))}
+          onUpdate={(id, input) => change(() => window.workspaceBridge.updateNodeType(id, input))}
+          onDelete={(id) => change(() => window.workspaceBridge.deleteNodeType(id))}
+          onClose={() => setManagingTypes(false)}
+        />
+      )}
       {importing && (
         <ImportDialog
           onImported={(result) => {
@@ -144,9 +203,17 @@ export function App() {
           onCancel={() => setImporting(false)}
         />
       )}
-      {dialog?.kind === 'create' && <NodeDialog onSubmit={(input) => void submit(() => window.workspaceBridge.createNode(input))} onCancel={() => setDialog(undefined)} />}
+      {dialog?.kind === 'create' && <NodeDialog titles={workspace?.nodes.map((node) => node.title) ?? []} nodeTypes={workspace?.nodeTypes ?? []} linkTargets={linkTargets(undefined, workspace?.nodes ?? [], workspace?.links ?? [], linked)} onSubmit={(input, linkTo) => void submit(() => window.workspaceBridge.createNode(input), linkTo)} onCancel={() => setDialog(undefined)} />}
       {dialog?.kind === 'edit' && (
-        <NodeDialog node={dialog.node} onSubmit={(input) => void submit(() => window.workspaceBridge.updateNode(dialog.node.id, input))} onCancel={() => setDialog(undefined)} />
+        <NodeDialog
+          node={dialog.node}
+          titles={workspace?.nodes.filter((node) => node.id !== dialog.node.id).map((node) => node.title) ?? []}
+          nodeTypes={workspace?.nodeTypes ?? []}
+          linkTargets={linkTargets(dialog.node.id, workspace?.nodes ?? [], workspace?.links ?? [], linked)}
+          onSubmit={(input, linkTo) => void submit(() => window.workspaceBridge.updateNode(dialog.node.id, input), linkTo, dialog.node.id)}
+          onCancel={() => setDialog(undefined)}
+          onDelete={() => deleteNode(dialog.node)}
+        />
       )}
       {newWorkspaceLocation !== null && (
         <NewWorkspaceDialog
@@ -164,20 +231,34 @@ export function App() {
       <SplitView
         direction="row"
         initialFirst={0.1}
-        first={workspace?.open && <NodeList nodes={workspace.nodes} linked={linked} onOpenNode={openNode} onNodeMenu={openMenu} />}
+        first={workspace?.open && <NodeList nodes={workspace.nodes} nodeTypes={workspace.nodeTypes} linked={linked} onOpenNode={openNode} onNodeMenu={openMenu} />}
         second={
           workspace?.open && (
-            <Canvas
-              key={opened}
-              saved={workspace.layout}
-              onLayout={(layout) => void window.workspaceBridge.saveLayout(layout).catch(() => undefined)}
-              nodes={linkedNodes}
-              links={workspace.links}
-              onCreateLink={(source, target) => void createLink(source, target)}
-              onUpdateLink={(link, input) => void change(() => window.workspaceBridge.updateLink(link, input))}
-              onOpenNode={openNode}
-              onNodeMenu={openMenu}
-              highlighted={highlighted}
+            <SplitView
+              direction="row"
+              sizeSecond
+              // The link list starts at a tenth of the window: the share is of what the node list leaves.
+              initialFirst={1 / 9}
+              first={
+                <Canvas
+                  key={opened}
+                  saved={workspace.layout}
+                  relayouts={relayouts}
+                  onLayout={(layout) => void window.workspaceBridge.saveLayout(layout).catch(() => undefined)}
+                  nodes={linkedNodes}
+                  links={workspace.links}
+                  colours={colours}
+                  onCreateLink={(source, target) => void createLink(source, target)}
+                  onUpdateLink={(link, input) => void change(() => window.workspaceBridge.updateLink(link, input))}
+                  onDeleteLink={deleteLink}
+                  onLinkMenu={(link, x, y) => setLinkMenu({ link: link.id, x, y })}
+                  onOpenNode={openNode}
+                  onNodeMenu={openMenu}
+                  highlighted={highlighted}
+                  onCanvasMenu={(x, y) => setCanvasMenu({ x, y })}
+                />
+              }
+              second={<LinkList links={workspace.links} nodes={workspace.nodes} onOpenLink={setWeighing} onLinkMenu={(link, x, y) => setLinkMenu({ link: link.id, x, y })} />}
             />
           )
         }
@@ -195,7 +276,41 @@ export function App() {
             closeMenu();
             void createLink(menu.source, target);
           }}
+          onDelete={() => {
+            const node = workspace.nodes.find((candidate) => candidate.id === menu.source);
+            closeMenu();
+            if (node) deleteNode(node);
+          }}
           onCancel={closeMenu}
+        />
+      )}
+      {canvasMenu && (
+        <CanvasMenu
+          x={canvasMenu.x}
+          y={canvasMenu.y}
+          onCreateNode={() => {
+            setCanvasMenu(undefined);
+            setDialog({ kind: 'create' });
+          }}
+          onCancel={() => setCanvasMenu(undefined)}
+        />
+      )}
+      {linkMenu && (
+        <LinkMenu
+          x={linkMenu.x}
+          y={linkMenu.y}
+          onDelete={() => {
+            setLinkMenu(undefined);
+            deleteLink(linkMenu.link);
+          }}
+          onCancel={() => setLinkMenu(undefined)}
+        />
+      )}
+      {deleting && (
+        <KeepCopyDialog
+          question="Keep the node's file, copied into the workspace, in the workspace folder?"
+          onAnswer={(keep) => deleteNode(deleting, keep)}
+          onCancel={() => setDeleting(undefined)}
         />
       )}
       {weighing && (
@@ -205,6 +320,7 @@ export function App() {
             setWeighing(undefined);
             if (input && linkChanged(weighing, input)) void change(() => window.workspaceBridge.updateLink(weighing.id, input));
           }}
+          onDelete={() => deleteLink(weighing.id)}
         />
       )}
     </div>

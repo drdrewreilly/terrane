@@ -5,28 +5,31 @@ export const linkChanged = (link: WorkspaceLink, input: LinkInput) => input.weig
 
 interface LinkDialogProps {
   link: WorkspaceLink;
-  /** The dialog was closed: with the link's weight and description from Save, or with nothing if it was cancelled. */
+  /** The dialog was closed: with the link's weight and description from Save, or with nothing if it was cancelled or Delete was pressed. */
   onClose: (input?: LinkInput) => void;
+  /** Delete was pressed: the link is to be deleted (after `onClose`). */
+  onDelete: () => void;
 }
 
 /**
  * What double-clicking a link, or creating one, opens (D11, D16): a slider for the link's weight (1–10) in its centre,
  * with the weight (rounded to a whole number) above it, a text area for the link's description, a Save button that sets
- * both, and a Cancel button that leaves the link as it was. Escape, or a press off the dialog, cancels it too.
+ * both, a Cancel button that leaves the link as it was, and a Delete button that deletes the link. Escape, or a press
+ * off the dialog, cancels it too.
  */
-export function LinkDialog({ link, onClose }: LinkDialogProps) {
+export function LinkDialog({ link, onClose, onDelete }: LinkDialogProps) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [weight, setWeight] = useState(link.weight);
   const [description, setDescription] = useState(link.description ?? '');
-  /** Whether the dialog is being closed by cancelling it (Cancel, Escape, or a press off the dialog). */
-  const cancelled = useRef(false);
+  /** How the dialog is being closed: by cancelling it (Cancel, Escape, or a press off the dialog), by Delete, or (neither) by Save. */
+  const closing = useRef<'cancel' | 'delete'>(undefined);
 
   useEffect(() => {
     dialog.current?.showModal();
   }, []);
 
   const cancel = () => {
-    cancelled.current = true;
+    closing.current = 'cancel';
     dialog.current?.close();
   };
 
@@ -40,9 +43,12 @@ export function LinkDialog({ link, onClose }: LinkDialogProps) {
   return (
     <dialog
       ref={dialog}
-      onCancel={() => (cancelled.current = true)}
+      onCancel={() => (closing.current = 'cancel')}
       onPointerDown={pressOff}
-      onClose={() => onClose(cancelled.current ? undefined : { weight, description })}
+      onClose={() => {
+        onClose(closing.current ? undefined : { weight, description });
+        if (closing.current === 'delete') onDelete();
+      }}
       data-testid="weight-dialog"
       className="m-auto w-80 rounded p-4 shadow-lg backdrop:bg-black/30"
     >
@@ -61,6 +67,17 @@ export function LinkDialog({ link, onClose }: LinkDialogProps) {
           />
         </div>
         <div className="flex gap-2">
+          <button
+            type="button"
+            data-testid="weight-delete"
+            className="rounded px-3 py-1.5 text-red-700 hover:bg-red-50"
+            onClick={() => {
+              closing.current = 'delete';
+              dialog.current?.close();
+            }}
+          >
+            Delete
+          </button>
           <button type="button" data-testid="weight-cancel" className="rounded px-3 py-1.5 text-slate-600 hover:bg-slate-100" onClick={cancel}>
             Cancel
           </button>

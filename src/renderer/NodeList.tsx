@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { handlerFor, isFileNode } from './handlers';
 import { displayLines } from './handlers/display';
 import { imageHandler, showsImage, useNodeImage } from './handlers/image';
+import { typeOf, valueOf } from './NodeTypes';
 import { SplitView } from './SplitView';
 
 /** A node's displayed text (its display lines) on one line: line breaks become spaces. */
@@ -9,6 +10,8 @@ export const displayText = (node: NodeRecord) => displayLines(node).join(' ').re
 
 interface NodeListProps {
   nodes: NodeRecord[];
+  /** The workspace's node types. */
+  nodeTypes: NodeType[];
   /** The ids of the nodes that have at least one link. */
   linked: Set<string>;
   /** The user double-clicked a node's entry. */
@@ -22,11 +25,11 @@ interface NodeListProps {
  * sized to fit its entries) and those with one (bottom). Each change to the search text shows only the nodes whose displayed text contains it
  * (ignoring case).
  */
-export function NodeList({ nodes, linked, onOpenNode, onNodeMenu }: NodeListProps) {
+export function NodeList({ nodes, nodeTypes, linked, onOpenNode, onNodeMenu }: NodeListProps) {
   const [search, setSearch] = useState('');
   const query = search.toLowerCase();
   const shown = nodes.filter((node) => displayText(node).toLowerCase().includes(query));
-  const entries = (list: NodeRecord[]) => list.map((node) => <NodeEntry key={node.id} node={node} onOpenNode={onOpenNode} onNodeMenu={onNodeMenu} />);
+  const entries = (list: NodeRecord[]) => list.map((node) => <NodeEntry key={node.id} node={node} nodeTypes={nodeTypes} onOpenNode={onOpenNode} onNodeMenu={onNodeMenu} />);
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col" data-testid="node-list">
@@ -58,7 +61,7 @@ export function NodeList({ nodes, linked, onOpenNode, onNodeMenu }: NodeListProp
  * of the text, wrapped (and, for an image node whose display shows its image, the image above it), and below it the node's
  * properties; clicking it again collapses it. A double-click's two clicks cancel out, so it only opens the node.
  */
-function NodeEntry({ node, onOpenNode, onNodeMenu }: { node: NodeRecord; onOpenNode: NodeListProps['onOpenNode']; onNodeMenu: NodeListProps['onNodeMenu'] }) {
+function NodeEntry({ node, nodeTypes, onOpenNode, onNodeMenu }: { node: NodeRecord; nodeTypes: NodeType[]; onOpenNode: NodeListProps['onOpenNode']; onNodeMenu: NodeListProps['onNodeMenu'] }) {
   const [expanded, setExpanded] = useState(false);
   const image = isFileNode(node) && handlerFor(node.filename).id === imageHandler.id && showsImage(node) ? node : undefined;
   const toggle = () => setExpanded((current) => !current);
@@ -88,23 +91,31 @@ function NodeEntry({ node, onOpenNode, onNodeMenu }: { node: NodeRecord; onOpenN
         <div data-testid="node-entry-text" className={expanded ? 'whitespace-pre-line break-words' : 'truncate'}>
           {displayLines(node).join('\n')}
         </div>
-        {expanded && <NodeProperties node={node} />}
+        {expanded && <NodeProperties node={node} type={typeOf(node, nodeTypes)} />}
       </div>
     </li>
   );
 }
 
-/** A node's text properties (title, description and body), each labelled; an empty one is shown as a dash. */
-function NodeProperties({ node }: { node: NodeRecord }) {
+/**
+ * A node's properties, each labelled: its text (title, description and body; an empty one is shown as a dash), its type,
+ * and its value for each of its type's properties (true/false ones as "True" or "False").
+ */
+function NodeProperties({ node, type }: { node: NodeRecord; type?: NodeType }) {
   const properties: [string, string | null][] = [
     ['Title', node.title],
     ['Description', node.description],
     ['Body', node.body],
+    ...(type ? ([['Type', type.name]] as [string, string][]) : []),
+    ...(type?.properties ?? []).map((property): [string, string | null] => {
+      const value = valueOf(node, property);
+      return [property.key, typeof value === 'boolean' ? (value ? 'True' : 'False') : value || null];
+    }),
   ];
   return (
     <dl data-testid="node-entry-properties" className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 border-t border-slate-100 pt-1 text-xs">
-      {properties.map(([label, value]) => (
-        <div key={label} data-testid="node-entry-property" data-property={label.toLowerCase()} className="contents">
+      {properties.map(([label, value], index) => (
+        <div key={index} data-testid="node-entry-property" data-property={label.toLowerCase()} className="contents">
           <dt className="text-slate-500">{label}</dt>
           <dd className={`whitespace-pre-line break-words ${value === null ? 'text-slate-400' : ''}`}>{value ?? '—'}</dd>
         </div>

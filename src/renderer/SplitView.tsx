@@ -3,8 +3,13 @@ import { useLayoutEffect, useRef, useState, type PointerEvent, type ReactNode } 
 interface SplitViewProps {
   first: ReactNode;
   second: ReactNode;
-  /** The first area's (left or top) starting share of the total width or height (0 to 1). */
+  /** The first area's (left or top) starting share of the total width or height (0 to 1); with `sizeSecond`, the second area's. */
   initialFirst: number;
+  /**
+   * The second area (right or bottom) is the one given a size, and the first takes the rest, so that the first is the one
+   * that grows and shrinks with the split view. Not with `fitFirst`.
+   */
+  sizeSecond?: boolean;
   direction: 'row' | 'column';
   /**
    * The first area is never larger than its content, so dragging cannot open empty space after it. It fits its content
@@ -17,10 +22,10 @@ interface SplitViewProps {
 
 /**
  * Two areas separated by a splitter that can be dragged to change how the space is shared between them: side by side
- * (`direction` "row", a vertical splitter) or one above the other ("column", a horizontal splitter). The first area is
- * never so large that the splitter is pushed out of view.
+ * (`direction` "row", a vertical splitter) or one above the other ("column", a horizontal splitter). The sized area (the
+ * first, or the second with `sizeSecond`) is never so large that the splitter is pushed out of view.
  */
-export function SplitView({ first, second, initialFirst, direction, fitFirst = false }: SplitViewProps) {
+export function SplitView({ first, second, initialFirst, direction, fitFirst = false, sizeSecond = false }: SplitViewProps) {
   const container = useRef<HTMLDivElement>(null);
   const firstArea = useRef<HTMLDivElement>(null);
   const splitter = useRef<HTMLDivElement>(null);
@@ -58,15 +63,20 @@ export function SplitView({ first, second, initialFirst, direction, fitFirst = f
   const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
     if (!event.currentTarget.hasPointerCapture(event.pointerId) || !container.current) return;
     const box = container.current.getBoundingClientRect();
-    const size = row ? event.clientX - box.left : event.clientY - box.top;
+    const at = row ? event.clientX - box.left : event.clientY - box.top;
+    // With `sizeSecond`, the size set is the second area's: from the splitter's far side to the end.
+    const size = sizeSecond ? (row ? box.width : box.height) - at - (row ? splitter.current!.offsetWidth : splitter.current!.offsetHeight) : at;
     // Dragged to (or past) the end of the content, the first area goes back to fitting it.
     if (fitFirst) dragged.current = size >= contentSize() - 0.5 ? null : Math.max(0, size);
     setFirstSize(size);
   };
 
+  /** The size of the sized area (the first, or with `sizeSecond` the second). */
+  const sized = row ? { width: `${firstShare * 100}%` } : { height: `${firstShare * 100}%` };
+
   return (
     <div ref={container} className={`flex min-h-0 min-w-0 flex-1 ${row ? '' : 'flex-col'}`}>
-      <div ref={firstArea} className="flex min-h-0 min-w-0 shrink-0 flex-col overflow-auto" style={row ? { width: `${firstShare * 100}%` } : { height: `${firstShare * 100}%` }}>
+      <div ref={firstArea} className={`flex min-h-0 min-w-0 flex-col overflow-auto ${sizeSecond ? 'flex-1' : 'shrink-0'}`} style={sizeSecond ? undefined : sized}>
         {first}
       </div>
       <div
@@ -81,7 +91,9 @@ export function SplitView({ first, second, initialFirst, direction, fitFirst = f
         }}
         onPointerMove={onPointerMove}
       />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-auto">{second}</div>
+      <div className={`flex min-h-0 min-w-0 flex-col overflow-auto ${sizeSecond ? 'shrink-0' : 'flex-1'}`} style={sizeSecond ? sized : undefined}>
+        {second}
+      </div>
     </div>
   );
 }

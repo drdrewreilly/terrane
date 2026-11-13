@@ -6,6 +6,7 @@ import { delimiter, join, normalize, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { APP_ID, APP_NAME, externalLinkOrigins, services } from './config';
 import { createSidecar } from './sidecar';
+import { parseNodeTypeInput } from './nodeTypes';
 import { parseImportKeys, parseLinkInput, parseNodeInput, Workspace } from './workspace';
 
 const APP_ORIGIN = 'app://app';
@@ -108,7 +109,11 @@ function createWindow(): BrowserWindow {
       spellcheck: false,
     },
   });
-  window.once('ready-to-show', () => window.show());
+  // Opens maximized (filling the screen's work area); 1100×760 is the size it restores to.
+  window.once('ready-to-show', () => {
+    window.maximize();
+    window.show();
+  });
   void window.loadURL(devUrl ?? `${APP_ORIGIN}/index.html`);
   return window;
 }
@@ -198,11 +203,33 @@ if (!app.requestSingleInstanceLock()) {
       if (typeof source !== 'string' || typeof target !== 'string') throw new Error('Invalid link');
       return workspace.createLink(source, target);
     });
+    ipcMain.handle('terrane:workspace.deleteNode', (event, id: unknown, keepCopy: unknown) => {
+      trusted(event);
+      if (typeof id !== 'string') throw new Error('Invalid node id');
+      if (keepCopy !== undefined && typeof keepCopy !== 'boolean') throw new Error('Invalid keepCopy');
+      return workspace.deleteNode(id, keepCopy);
+    });
+    ipcMain.handle('terrane:workspace.deleteLink', (event, id: unknown) => {
+      trusted(event);
+      if (typeof id !== 'string') throw new Error('Invalid link id');
+      return workspace.deleteLink(id);
+    });
     ipcMain.handle('terrane:workspace.saveLayout', (event, layout: unknown) => (trusted(event), workspace.saveLayout(layout)));
     ipcMain.handle('terrane:workspace.updateLink', (event, id: unknown, input: unknown) => {
       trusted(event);
       if (typeof id !== 'string') throw new Error('Invalid link id');
       return workspace.updateLink(id, parseLinkInput(input));
+    });
+    ipcMain.handle('terrane:workspace.createNodeType', (event, input: unknown) => (trusted(event), workspace.createNodeType(parseNodeTypeInput(input))));
+    ipcMain.handle('terrane:workspace.updateNodeType', (event, id: unknown, input: unknown) => {
+      trusted(event);
+      if (typeof id !== 'string') throw new Error('Invalid node type id');
+      return workspace.updateNodeType(id, parseNodeTypeInput(input));
+    });
+    ipcMain.handle('terrane:workspace.deleteNodeType', (event, id: unknown) => {
+      trusted(event);
+      if (typeof id !== 'string') throw new Error('Invalid node type id');
+      return workspace.deleteNodeType(id);
     });
     try {
       await manager.restore();

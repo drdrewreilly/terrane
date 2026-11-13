@@ -8,11 +8,44 @@ declare global {
   interface TerraneNode {
     id: string;
     addedAt: string;
-    title: string | null;
+    /** Required, and unique among the workspace's nodes. */
+    title: string;
     description: string | null;
     body: string | null;
     /** The fields shown in the node's display (at least one, each with text), in the order title, description, body. */
     display: DisplayField[];
+    /** The `id` of the node's type. */
+    type: string;
+    /** The node's value for each of its type's properties, by property id. */
+    properties: Record<string, PropertyValue>;
+  }
+
+  /** A property's value: text, or true or false. */
+  type PropertyValue = string | boolean;
+
+  /** A property that the nodes of a type have (see main/nodeTypes.ts). */
+  interface PropertyDefinition {
+    id: string;
+    key: string;
+    kind: 'text' | 'boolean';
+    /** The value a node of the type starts with. */
+    value: PropertyValue;
+  }
+
+  /** A kind of node: the background colour of its displays (`#rrggbb`) and the properties its nodes have. */
+  interface NodeType {
+    id: string;
+    /** Unique among the workspace's node types. */
+    name: string;
+    colour: string;
+    properties: PropertyDefinition[];
+  }
+
+  /** What the node type dialog sends to create or save a node type; a property without an `id` is new. */
+  interface NodeTypeInput {
+    name: string;
+    colour: string;
+    properties: { id?: string; key: string; kind: 'text' | 'boolean'; value: PropertyValue }[];
   }
 
   /** A node with a file. */
@@ -30,6 +63,10 @@ declare global {
     description: string;
     body: string;
     display: DisplayField[];
+    /** The `id` of the node's type. */
+    type: string;
+    /** Values for the type's properties, by property id. */
+    properties: Record<string, PropertyValue>;
     /** `source` is a newly chosen file (absent: the node keeps its current one); `copy` is whether the file is (to be) copied into the workspace. */
     file?: { source?: string; copy: boolean };
     /** When saving replaces a file that was copied into the workspace: whether that copy is kept. */
@@ -57,8 +94,6 @@ declare global {
     /** Identifies the network it was worked out for (see Canvas.tsx): it is used as it is only while that matches. */
     network: string;
     positions: Record<string, { x: number; y: number }>;
-    scale: number;
-    minSpace: number;
     satisfied: boolean;
   }
 
@@ -67,6 +102,8 @@ declare global {
     name?: string;
     nodes: NodeRecord[];
     links: WorkspaceLink[];
+    /** The default type (id `default`) first. */
+    nodeTypes: NodeType[];
     layout?: SavedLayout;
   }
 
@@ -110,8 +147,18 @@ declare global {
       createLink: (source: string, target: string) => Promise<WorkspaceResult>;
       /** Sets a link's weight (1 to 10) and description in `workspace.json`. */
       updateLink: (id: string, input: LinkInput) => Promise<WorkspaceResult>;
+      /** Deletes a node, every link to or from it and its saved position; a copy of its file in the workspace is removed unless `keepCopy`. */
+      deleteNode: (id: string, keepCopy?: boolean) => Promise<WorkspaceResult>;
+      /** Deletes a link. */
+      deleteLink: (id: string) => Promise<WorkspaceResult>;
       /** Saves the layout worked out for the network in `workspace.json`, replacing any saved before. */
       saveLayout: (layout: SavedLayout) => Promise<void>;
+      /** Records a new node type in `workspace.json`; refused if another type has its name. */
+      createNodeType: (input: NodeTypeInput) => Promise<WorkspaceResult>;
+      /** Replaces a node type; its nodes keep the values of the properties it still has. */
+      updateNodeType: (id: string, input: NodeTypeInput) => Promise<WorkspaceResult>;
+      /** Deletes a node type (not the default one); its nodes become nodes of the default type. */
+      deleteNodeType: (id: string) => Promise<WorkspaceResult>;
     };
   }
 }

@@ -1,112 +1,122 @@
-# Terrane: rules and guidelines for the layout of the network on the canvas
+# Network canvas layout: rules, principles and guidelines
 
-Source: the application code only, mainly `src/renderer/layout.ts` (node positions), `src/renderer/paths.ts` (link paths) and `src/renderer/Canvas.tsx` (the canvas), with `App.tsx`, `handlers/default.tsx`, `handlers/image.tsx`, `LinkDisplay.tsx` and `src/main/workspace.ts` where they affect the layout.
+Extracted from the code as it stands on branch `fruchterman-reingold` (2026-11-12). Listed by priority: a higher item is
+never given up to meet a lower one.
 
-**Rule** = something the code always enforces, or a goal it works until it meets. **Guideline** = a preference the code pursues only while the rules above it still hold.
+## Elements responsible
 
-## 1. Priority order
-
-Where two items conflict, the one higher in this list wins. The order comes from how the code compares candidate layouts (`asClose`) and from the order of its steps in `runLayout`.
-
-| Priority | Item | Kind | Detail in |
-| --- | --- | --- | --- |
-| 1 | Minimum space between node displays: at least 16 × scale | Rule | 2.1 |
-| 2 | Goal 1: every link has a clear path (no link crosses a display, 12 px clearance) | Rule (goal) | 2.2, 3 |
-| 3 | Goal 2: every link's distance is within the range for its weight | Rule (goal) | 2.3 |
-| 4 | Use the smallest distance scale that meets goals 1 and 2 | Rule | 2.4 |
-| 5 | Fewest possible links crossing each other | Guideline | 5.1 |
-| 6 | Linked nodes line up on a horizontal or vertical axis (diagonal if they cannot) | Guideline | 5.2 |
-| 7 | Simulation preferences: room between close displays, a weak pull to the middle, new displays placed near their neighbours | Guideline | 5.3 |
-
-How the order shows up in the code:
-- Spacing is enforced at the end of every simulation step (`separate`). A layout is only counted as having clear paths or in-range distances if its displays are spaced; paths are not even worked out for a layout that is not.
-- Layouts are ranked: all goals met, then paths clear and displays spaced (but some distances out of range), then anything else. Layouts of the same rank are compared by how far the distances are out of range. So **goal 1 (clear paths) beats goal 2 (distances)** when both cannot be met.
-- The scale is settled (priority 4) before crossings are reduced and before alignment, and both of those work at that scale, so neither can cause a larger scale.
-- Crossing-reduction and alignment keep a move only if the layout is still at least as close to the goals as before (so a layout that met the goals still meets them).
-- Alignment keeps a move only if it causes no more crossings than before, and runs only if the goals were met.
-
-## 2. Rules
-
-### 2.1 Space between node displays
-- The space between two displays is the larger of their gaps along x and along y, and must be at least `16 × scale` (16 px at scale 1).
-- Displays that are closer are moved apart along whichever axis needs the smaller move.
-
-### 2.2 Goal 1: no link crosses a node display
-- A link touches only the displays of its own two nodes, at its two ends, and keeps a clearance of 12 px from every other display. (The line is 2 px thick, so the middle of the line keeps 13 px.)
-- A layout meets this goal only when every link has a clear path (see 3).
-- Links may cross other links; see 5.1.
-
-### 2.3 Goal 2: link distances follow weights
-- A link's distance is measured between the nearest edges of its two displays; it is negative if they overlap.
-- Higher weight, shorter distance. Each weight has a range of distances, and the goal is met only when every link's distance is within its range (no tolerance).
-- For a weight *w* at scale *s*, the range starts at `(30 + 30 × (10 − w)) × s`, and ends 1 before the start of the range for weight *w* − 1. For weight 1 it ends at `start + 30 × s − 1`. So the ranges are continuous, one distance unit apart, and all 30 × *s* wide.
-
-| Weight | Range at scale 1 (px) |
+| Element | Role |
 | --- | --- |
-| 10 | 30–59 |
-| 9 | 60–89 |
-| 8 | 90–119 |
-| 7 | 120–149 |
-| 6 | 150–179 |
-| 5 | 180–209 |
-| 4 | 210–239 |
-| 3 | 240–269 |
-| 2 | 270–299 |
-| 1 | 300–329 |
+| `src/renderer/layout.ts` | Positions the node displays (centres at zoom 1): seeding, descent, making room for lines, refinement. |
+| `src/renderer/paths.ts` | Routes each link's line between the displays; defines the gap constants. |
+| `src/renderer/view.ts` | Shows the laid-out network at a zoom: scales distances, shrinks displays where needed, re-routes lines, sets the zoom-out limit. |
+| `src/renderer/Canvas.tsx` | Measures displays, runs/reuses the layout, centres, pans and zooms the network, draws lines and displays. |
+| `src/renderer/LinkDisplay.tsx` | Draws a link's line (width, no arrowheads). |
+| `src/renderer/handlers/default.tsx`, `image.tsx` | Fix each display's size, the input the layout works with. |
+| `src/main/workspace.ts` (`SavedLayout`) | Saves the layout in `workspace.json` so it can be reused. |
 
-- A new link has weight 5. A weight is any number from 1 to 10 (the main process refuses others; the slider is continuous), and the ranges are worked out for any such value.
-- Links from a node to itself, or to a node that is not on the canvas, are ignored by the layout.
-- Two links between the same pair of nodes with far-apart weights cannot both be met. See 2.4 for what then happens.
+## Priority 1 — Hard rules (always met)
 
-### 2.4 Distance scale
-- The ranges of every weight are scaled together. The scale starts at 1 and is never less than 1.
-- If the goals are not met at scale 1, the scale is multiplied by 1.5 until they are met, but never goes above 8 (so the last scale tried is 7.59375).
-- Once they are met at a larger scale, the layout narrows down between the last scale that failed and the first that worked (4 steps) and ends at the smallest scale found that meets the goals.
-- If no scale meets the goals, the layout keeps, from the trials that had clear paths and spaced displays, the one that missed the distances by least (any within 5% of the least, plus 1, count as equal, and the smallest scale of those is used). If none had clear paths and spaced displays, it keeps the last trial. The result is then marked as not satisfied.
+1. **R1 between displays.** Every two displays are at least `MIN_GAP` (16 px) apart, measured along x *or* along y
+   (being 16 px apart on either axis is enough). (`paths.ts`, `layout.ts`)
+2. **R1 for lines.** Every part of a link's line (2 px wide) is at least `MIN_GAP` from every display except its own two,
+   so the line's centre keeps `LINE_GAP` (17 px) from them. Distance is measured against each display grown by
+   `LINE_GAP` into a larger, square-cornered rectangle. (`paths.ts`)
+3. **R2. No line crosses a display.** A line runs from the edge of one of its displays to the edge of the other, never
+   enters either, and (by R1) keeps clear of every other display. (`paths.ts`)
+4. **Rules hold at every zoom.** When the view is zoomed out, R1 and R2 are re-established for that zoom (displays shrink,
+   lines are re-routed) rather than relaxed. (`view.ts`)
+5. **Spreading always restores the rules.** Displays at least `ROOM_FOR_LINES` (2 × `LINE_GAP` + 1 = 35 px) apart always
+   leave room for a line between them, so moving displays apart — or spreading the whole network about its middle —
+   is the guaranteed remedy when a line is shut in. (`paths.ts`, `layout.ts`, `view.ts`)
+6. **Failure is flagged, not hidden.** If a line cannot be routed under R1/R2, it is marked not `clear` and drawn straight
+   between the displays' centres; the layout reports `satisfied: false`, which is saved with it. Refinement is skipped
+   unless both rules hold. (`paths.ts`, `layout.ts`)
 
-### 2.5 When the layout runs and stops
-- The canvas runs the layout whenever its network changes: the nodes shown, the size of a display, or a link's id, source, target or weight. This includes when a workspace is opened.
-- It waits until every display has been measured, and until a spinner has been painted. A spinner shows in the centre of the canvas while a layout is pending.
-- A simulation run stops as soon as its goals are met (checked every 20 iterations), or after 400 iterations. The steps that follow (crossings, alignment) run on fixed budgets of simulation runs and iterations, shared out by the number of links.
-- Positions are not stored. Each run starts from the positions of the previous run, and places any display without one (see 5.3).
+## Priority 2 — Line routing (within the rules)
 
-## 3. Rules for the path of each link (`paths.ts`)
+7. **Shortest line.** Each line is the shortest path from one display's edge to the other's that keeps R1 and R2.
+8. **Straight segments only.** A single straight segment where one is clear; otherwise a polyline that bends only at the
+   (grown) corners of displays in its way (visibility graph + Dijkstra).
+9. **Facing displays join across their shared span.** Where two displays overlap along x or y, the line crosses the gap
+   perpendicular to it, at the clear position nearest the middle of the shared span.
+10. **Non-facing displays join corner to corner.** Otherwise the straight line joins their nearest corners.
+11. **Bent lines leave and arrive at nearest points.** A bent line leaves a display at its point nearest the first bend and
+    reaches the other at its point nearest the last.
+12. **Search near first.** Routing tries only the displays near the two ends (64 px, then 256 px beyond their box) before
+    all of them; a path found that way is kept only if it is clear of every display.
 
-Paths are worked out from the display positions on the canvas, and again whenever they change. In priority order:
+## Priority 3 — Layout preferences (met as far as the rules allow)
 
-1. **A clear path.** A path never goes inside a display other than at its own two ends, and keeps at least 12 px (13 px from the middle of the line) from every other display.
-2. **The ideal anchors, if a clear single curve joins them.** Each display has eight anchors: the midpoints of its edges and its corners. A path leaves and enters at an anchor, at right angles to the edge (diagonally at a corner). The ideal anchors are the ones facing each other along the axis (horizontal, vertical or diagonal) nearest the line between the display centres. Between displays that sit on that axis, facing anchors give a straight line.
-3. **Any other clear single curve** (a cubic Bézier between two anchors), shortest first.
-4. **A path routed around the displays,** if no single curve is clear: the shortest path among the displays (inflated by 16 px), found with a visibility graph and Dijkstra's algorithm, with its corners rounded (radius 32, 16, 8, 4 or 0, the largest that stays clear). Pairs of anchors are tried nearest first, and the shortest clear path wins.
-5. **Spreading.** Where two or more paths meet a display at the same anchor, all but the shortest move to a neighbouring anchor if that anchor has no more paths than are left at this one and a clear path exists there. Each end of a path moves at most once, and a path that is not clear does not move.
-6. **Fallback.** A link with no clear path is drawn as its shortest single curve and marked not clear. That leaves goal 1 unmet.
+For each link of weight *w* (1–10), `target(w) = 40 + 30 × (10 − w)` px: a stronger link is shorter (w 10 → 40 px,
+w 1 → 310 px).
 
-## 4. The canvas (`Canvas.tsx`, `App.tsx`)
-- Only nodes that have at least one link are on the canvas; the others appear only in the node list.
-- One distance unit is one pixel (`UNIT_PX = 1`). The layout uses the measured pixel size of each display, and runs again if a display changes size (for example, when its font loads).
-- Display sizes: a default or text node is a golden-ratio rectangle, 162×100 or the smallest larger one that holds its text; an image node is 100×125 (portrait) when it shows its image, or 100×100 when it shows its body.
-- The content takes in every display and every point on every link's path, with a 16 px margin. A curve that bows out beyond the displays adds to the content.
-- The canvas has scrollbars when the content is larger than it. When the content is smaller, it is centred; when larger, the canvas scrolls to the centre of the network each time a layout settles.
-- Eight connection points show on a display when the pointer is over it (edge midpoints and corners). For now they do nothing. A link is made by pressing anywhere else on a display and releasing over another node's display.
+13. **P1. Border distance on target.** The shortest distance between the two displays' edges equals `target(w)`.
+14. **P2. Line length on target.** The routed line is `target(w)` long.
+15. **P3. Detours alike.** The variance across links of (P1 error − P2 error) is as small as possible: every line's detour
+    beyond the straight way is kept similar, which counts against lines that wind round other displays.
+16. **One score.** The preferences are weighed together as Σ(P1 error² + P2 error²) + Σ((P1 error − P2 error) − mean)²,
+    made as low as the rules allow. A straight line makes P1 and P2 agree, so straight lines are favoured.
 
-## 5. Guidelines
+## Priority 4 — Layout procedure (how a run meets the above)
 
-### 5.1 Few links crossing each other (priority 5)
-- Done by `untangle`, at the scale already found. Two links cross when their paths intersect anywhere except within 8 px of an end they share.
-- While links cross, it takes a display at the end of a crossing link (those with the fewest links first) and tries 11 other positions around the middle of the displays it is linked to, at the same distance from that middle as now, nearest its current position first. A position is tried only if, taking links as straight lines, it would not give that display's links as many crossings as now (or none).
-- Each try runs the simulation (100 iterations) from there. The result is kept only if it is at least as close to the goals as before and has fewer crossings.
-- The most simulation runs is 60, or fewer for a network with many links (no more than 600 paths worked out in all).
+17. **Start from scratch when the network's shape changes.** After a node or link is added or deleted (or on the
+    toolbar's "Lay out the network from scratch"), a run starts with no positions and every display is seeded. After
+    any other change (a weight, a display's size), and on opening, it starts from the previous run's positions, or the
+    workspace's saved ones, and only displays without a position are seeded.
+18. **Seeding order and placement.** Unplaced displays with the most links to placed ones go first, each at its first
+    link's target distance from that display, at whichever of 24 angles best meets its links' targets while keeping R1
+    (moving further out, ×1.25 + 16 px, if no angle fits). A display linked to nothing placed goes 16 px to the right of
+    everything placed, at their mean height.
+19. **Descent with straight lines.** 400 steps down the score's slope, treating every line as straight; the most a
+    display moves per step shrinks from 50 px to 1 px.
+20. **Keep lines' room during descent.** After every step, a display within `LINE_GAP` of another link's straight line is
+    pushed away from it (the line's two displays move half as far the other way), then R1 between displays is enforced.
+21. **Enforce R1 by the smaller move.** Two displays too close are moved apart, equally, along whichever axis needs the
+    smaller move.
+22. **Make room for shut-in lines.** Route all lines; for each one not clear, displays near its ends are moved apart to
+    `ROOM_FOR_LINES` (up to 4 rounds); if any line is still shut in, spread the whole network about its middle by ×1.1
+    until every line routes.
+23. **Refine with routed lines.** Move one display at a time — worst-missing displays first — trying eight directions at a
+    halving step (64 → 2 px), the average of its links' target spots and halfway there, and 24 spots round each linked
+    display at that link's target. Rank candidates by estimated score (lines taken as straight), route the best 3, and
+    keep the first that keeps R1 and R2 and lowers the true score. Re-route every line the move could affect. Stop when
+    a full pass moves nothing or 20 000 paths have been worked out.
 
-### 5.2 Alignment (priority 6)
-- Done only if every goal was met. Two steps, `settle` and then `align`, make nodes joined by a link line up, centred, on a horizontal or vertical axis, or failing that a diagonal one.
-- The cost for a link is how far the second centre is from the nearest axis through the first. A diagonal axis counts as 8 px worse, so a diagonal is used only when it is more than 8 px closer than a horizontal or vertical axis.
-- `settle` runs the simulation (300 iterations, in steps of at most `3 × scale`) with each link also pulling its displays towards lining up by 10% of the misalignment. It checks every 10 iterations and keeps the positions if they are better aligned.
-- `align` moves one display at a time (up to 20 passes) to the position that lines it up best with the displays it is linked to, trying positions on its horizontal, vertical and diagonal axes, and part-way there.
-- Both keep a change only if the displays stay spaced, no link's distance is further out of range than before, the paths are at least as close to the goals (see `asClose`), and the number of crossings does not rise. Each is limited to 300 divided by the number of links in path calculations.
+## Priority 5 — View, zoom and canvas
 
-### 5.3 Simulation preferences (priority 7)
-- The simulation is a force simulation that starts from the Fruchterman-Reingold algorithm. The most a display moves in one step cools from `40 × scale` to 1 over the run.
-- A link pushes or pulls its two displays towards the middle half of its range, when the distance is within a quarter of the range's width of either end.
-- Displays closer than `40 × scale` push each other away, to leave room for links to pass between them.
-- A weak pull towards the middle of all displays keeps the network together.
-- A display with no previous position is placed near the middle of the displays it is linked to (or the middle of all displays if none has a position), at the nearest spot that is at least 40 px clear of the displays already placed.
+24. **Zoom scales distances, not displays.** Zooming changes the distances between centres (about the middle of the box
+    round them); displays stay full size unless R1/R2 would break, and then shrink about their centre only as far as
+    needed — each too-close pair by the same factor, then each grown back as far as room allows.
+25. **Shut-in lines when zoomed out.** Displays near a shut-in line's ends shrink further to keep `ROOM_FOR_LINES`; after 4
+    rounds, every display keeps that room.
+26. **Lines keep their width** (2 px; 12 px invisible hit area) at every zoom; only their length changes. No arrowheads.
+27. **Zoom limits.** Zoom 1 is as far in as it goes. As far out is the first zoom at which the whole network, lines
+    included, fits the canvas with a 16 px margin — but never so far that two displays would need to shrink below
+    `MIN_SCALE` (0.1) to keep `ROOM_FOR_LINES`.
+28. **Centre the network.** The box round displays *and* lines is centred on the canvas; it is centred again each time
+    the layout settles, at a zoom no further out than fits. A workspace opens zoomed right out; until the wheel is
+    turned, each layout is shown zoomed right out.
+29. **Zoom about the pointer; keep the network in reach.** The point under the pointer stays put. Zooming out keeps the
+    network wholly inside the canvas along an axis where it is smaller, and covering it where it is larger.
+30. **The canvas never scrolls**; dragging the background pans.
+
+## Priority 6 — Inputs, persistence and responsiveness
+
+31. **Layout works with measured display sizes.** Displays are laid out and measured at full size; the default display is
+    the smallest golden-mean rectangle (≥ 162 × 100) that holds its content, its height then trimmed to the content. A
+    display that resizes (e.g. once fonts load) triggers a new layout.
+32. **Re-run on change.** The layout runs whenever nodes, links (including weight), display sizes, or the from-scratch
+    request change (from scratch or not, as in 17), and every run is saved to `workspace.json`.
+33. **Reuse a matching saved layout.** On opening, a saved layout is used as is (no run) if its key — a hash of the
+    algorithm id (`LAYOUT_ALGORITHM`) plus the nodes, their display sizes and the links — matches and it positions every
+    node. Changing the algorithm id invalidates older saved layouts.
+34. **Ignore degenerate links.** Self-links and links to unknown nodes are not laid out or routed.
+35. **Show progress.** While a layout is pending, a spinner shows centred over the canvas; the run waits until it has
+    been painted.
+
+## Notes on the code
+
+- P3 has no effect during descent (with straight lines both errors are equal); it only acts in refinement.
+- The comment in `Canvas.tsx` that "a curve can bow out beyond the displays" is out of date: lines are straight segments,
+  though a bent line can still reach beyond the displays' box.

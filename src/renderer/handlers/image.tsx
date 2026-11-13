@@ -43,7 +43,7 @@ export const imageHandler: Handler = {
     const lines = displayLines(node);
     if (!showImage) {
       return (
-        <div data-testid="node" data-handler="image" className="flex h-[100px] w-[100px] flex-col items-center justify-center overflow-hidden break-words rounded border border-slate-300 bg-white p-1 text-center text-sm">
+        <div data-testid="node" data-handler="image" className="flex h-[100px] w-[100px] flex-col items-center justify-center overflow-hidden break-words rounded border border-slate-300 bg-[var(--node-colour,#ffffff)] p-1 text-center text-sm">
           {lines.map((line, index) => (
             <div key={index} data-testid="node-line" className="w-full whitespace-pre-line">
               {line}
@@ -53,7 +53,7 @@ export const imageHandler: Handler = {
       );
     }
     return (
-      <div data-testid="node" data-handler="image" className="flex h-[125px] w-[100px] flex-col overflow-hidden rounded bg-white ring-1 ring-slate-300">
+      <div data-testid="node" data-handler="image" className="flex h-[125px] w-[100px] flex-col overflow-hidden rounded bg-[var(--node-colour,#ffffff)] ring-1 ring-slate-300">
         <div data-testid="node-image" className="flex h-[80%] w-full items-center justify-center">
           {src && <img src={src} alt={node.filename} className="h-full w-full object-contain" />}
         </div>

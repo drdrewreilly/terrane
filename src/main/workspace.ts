@@ -2,6 +2,7 @@ import { acquireLock, FORMAT_VERSION, type WorkspaceLock } from './lock';
 import { randomUUID } from 'node:crypto';
 import { access, constants, copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join } from 'node:path';
+import { DEFAULT_TYPE_ID, loadedNodeTypes, nodeTypeFrom, propertyValues, type NodeType, type NodeTypeInput, type PropertyValue } from './nodeTypes';
 
 /** The text fields of a node, in the order they are shown. */
 export const DISPLAY_FIELDS = ['title', 'description', 'body'] as const;
@@ -11,11 +12,16 @@ export type DisplayField = (typeof DISPLAY_FIELDS)[number];
 export interface TerraneNode {
   id: string;
   addedAt: string;
-  title: string | null;
+  /** Required, and unique among the workspace's nodes: a node can be identified by its title. */
+  title: string;
   description: string | null;
   body: string | null;
   /** The fields shown in the node's display (at least one, each with text), in the order title, description, body. */
   display: DisplayField[];
+  /** The `id` of the node's type (see main/nodeTypes.ts); a node written before there were types is of the default type. */
+  type: string;
+  /** The node's value for each of its type's properties, by property id. */
+  properties: Record<string, PropertyValue>;
 }
 
 /** A node with a file. */
@@ -39,6 +45,10 @@ export interface NodeInput {
   description: string;
   body: string;
   display: DisplayField[];
+  /** The `id` of the node's type. */
+  type: string;
+  /** Values for the type's properties, by property id; one missing (or of the wrong kind) takes the property's default value. */
+  properties: Record<string, PropertyValue>;
   /** The node's file, if it has one. `source` is a newly chosen file (absent: the node keeps its current one); `copy` is whether the file is (to be) copied into the workspace. */
   file?: { source?: string; copy: boolean };
   /** When saving replaces a file that was copied into the workspace: whether that copy is kept in the workspace folder. */
@@ -57,9 +67,14 @@ export function parseNodeInput(value: unknown): NodeInput {
     Array.isArray(input.display) &&
     input.display.every((field) => DISPLAY_FIELDS.includes(field)) &&
     (input.file === undefined || (typeof input.file === 'object' && input.file !== null && typeof input.file.copy === 'boolean' && (input.file.source === undefined || typeof input.file.source === 'string'))) &&
+    typeof input.type === 'string' &&
+    typeof input.properties === 'object' &&
+    input.properties !== null &&
+    !Array.isArray(input.properties) &&
+    Object.values(input.properties).every((property) => typeof property === 'string' || typeof property === 'boolean') &&
     (input.keepOldCopy === undefined || typeof input.keepOldCopy === 'boolean');
   if (!valid) throw new Error('Invalid node');
-  return { title: input.title!, description: input.description!, body: input.body!, display: input.display!, file: input.file && { source: input.file.source, copy: input.file.copy }, keepOldCopy: input.keepOldCopy };
+  return { title: input.title!, description: input.description!, body: input.body!, display: input.display!, type: input.type!, properties: { ...input.properties! }, file: input.file && { source: input.file.source, copy: input.file.copy }, keepOldCopy: input.keepOldCopy };
 }
 
 /** An entry of the `links` array in `workspace.json`: a connection from a source node to a target node. */
@@ -108,10 +123,9 @@ export function parseImportKeys(value: unknown): ImportKeys {
  */
 export interface SavedLayout {
   network: string;
-  /** The centre of each node's display, by node id, in distance units. */
+  /** The centre of each node's display, by node id, in pixels at zoom 1. */
   positions: Record<string, { x: number; y: number }>;
-  scale: number;
-  minSpace: number;
+  /** Whether the layout met its rules. */
   satisfied: boolean;
 }
 
@@ -119,14 +133,14 @@ export interface SavedLayout {
 export function parseSavedLayout(value: unknown, nodeIds: Set<string>): SavedLayout {
   const layout = value as Partial<SavedLayout> | null;
   const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
-  if (typeof layout !== 'object' || layout === null || typeof layout.network !== 'string' || !finite(layout.scale) || !finite(layout.minSpace) || typeof layout.satisfied !== 'boolean') throw new Error('Invalid layout');
+  if (typeof layout !== 'object' || layout === null || typeof layout.network !== 'string' || typeof layout.satisfied !== 'boolean') throw new Error('Invalid layout');
   if (typeof layout.positions !== 'object' || layout.positions === null || Array.isArray(layout.positions)) throw new Error('Invalid layout');
   const positions: Record<string, { x: number; y: number }> = {};
   for (const [id, at] of Object.entries(layout.positions)) {
     if (!finite(at?.x) || !finite(at?.y)) throw new Error('Invalid layout');
     if (nodeIds.has(id)) positions[id] = { x: at.x, y: at.y };
   }
-  return { network: layout.network, positions, scale: layout.scale, minSpace: layout.minSpace, satisfied: layout.satisfied };
+  return { network: layout.network, positions, satisfied: layout.satisfied };
 }
 
 export interface WorkspaceState {
@@ -135,6 +149,8 @@ export interface WorkspaceState {
   name?: string;
   nodes: NodeRecord[];
   links: WorkspaceLink[];
+  /** The workspace's node types, the default type first. */
+  nodeTypes: NodeType[];
   /** The layout saved in `workspace.json`, if any. */
   layout?: SavedLayout;
 }
@@ -157,9 +173,78 @@ const WORKSPACE_FILE = 'workspace.json';
 /** The weight of a new link. */
 const NEW_LINK_WEIGHT = 5;
 
-/** The text fields of `input` (empty strings as `null`) and the fields it shows: those ticked that have text, in display order. Refused if none is shown. */
+/** How many characters of a node's text make the title of a node that has none. */
+const TITLE_LENGTH = 25;
+/** The title of a node that has no title and no text to make one from. */
+const DEFAULT_TITLE = 'Node';
+
+/** A title made from the first of `texts` with text: its first 25 characters, runs of whitespace as single spaces; "Node" if none has text. */
+export function titleFrom(texts: (string | null | undefined)[]): string {
+  for (const text of texts) {
+    const line = text?.replace(/\s+/g, ' ').trim();
+    if (line) return Array.from(line).slice(0, TITLE_LENGTH).join('').trim();
+  }
+  return DEFAULT_TITLE;
+}
+
+/** `title` if `taken` does not hold it, else `title` with the first free integer from 2 added to its end ("Node2", "Node3", …). */
+export function uniqueTitle(title: string, taken: Set<string>): string {
+  if (!taken.has(title)) return title;
+  let n = 2;
+  while (taken.has(`${title}${n}`)) n += 1;
+  return `${title}${n}`;
+}
+
+/**
+ * Unique titles for a list of nodes, none of them in `taken` (which is extended with them). Each node has the title it was
+ * `given` (trimmed; empty for none) or else its `fallback`. Given titles are kept first, in order; a title given again,
+ * and every fallback, has an integer added to its end if it is taken (see `uniqueTitle`).
+ */
+function uniqueTitles(wanted: { given: string; fallback: () => string }[], taken: Set<string>): string[] {
+  const kept = wanted.map(({ given }) => {
+    if (given === '' || taken.has(given)) return undefined;
+    taken.add(given);
+    return given;
+  });
+  return kept.map((title, index) => {
+    if (title !== undefined) return title;
+    const { given, fallback } = wanted[index];
+    const unique = uniqueTitle(given || fallback(), taken);
+    taken.add(unique);
+    return unique;
+  });
+}
+
+/** A node's own title, trimmed; empty if it has none (as a node written before titles were required may not). */
+const ownTitle = (node: { title?: unknown }) => (typeof node.title === 'string' ? node.title.trim() : '');
+
+/** `nodes`, each with a unique title: one it lacks is made from its description, body or filename (see `titleFrom`). */
+function titledNodes(nodes: NodeRecord[]): NodeRecord[] {
+  const titles = uniqueTitles(
+    nodes.map((node) => ({ given: ownTitle(node), fallback: () => titleFrom([node.description, node.body, isFileNode(node) ? node.filename : null]) })),
+    new Set(),
+  );
+  return nodes.map((node, index) => (node.title === titles[index] ? node : { ...node, title: titles[index] }));
+}
+
+/**
+ * `nodes`, each of one of `types` (a node of none, as one written before there were types, is of the default type) and
+ * with a value for each of its type's properties (see `propertyValues`). A node that already is so is kept as it is.
+ */
+function typedNodes(nodes: NodeRecord[], types: NodeType[]): NodeRecord[] {
+  return nodes.map((node) => {
+    const type = types.find((candidate) => candidate.id === node.type) ?? types.find((candidate) => candidate.id === DEFAULT_TYPE_ID)!;
+    const properties = propertyValues(type, node.properties);
+    if (node.type === type.id && JSON.stringify(node.properties) === JSON.stringify(properties)) return node;
+    return { ...node, type: type.id, properties };
+  });
+}
+
+/** The text fields of `input` (the title trimmed; empty strings as `null`) and the fields it shows: those ticked that have text, in display order. Refused without a title, or if none is shown. */
 function textFields(input: NodeInput): Pick<TerraneNode, 'title' | 'description' | 'body' | 'display'> {
-  const fields = { title: input.title || null, description: input.description || null, body: input.body || null };
+  const title = input.title.trim();
+  if (title === '') throw new Error('A node must have a title');
+  const fields = { title, description: input.description || null, body: input.body || null };
   const display = DISPLAY_FIELDS.filter((field) => input.display.includes(field) && fields[field] !== null);
   if (display.length === 0) throw new Error('A node must show at least one field with text');
   return { ...fields, display };
@@ -205,13 +290,81 @@ export class Workspace {
   private nodes: NodeRecord[] = [];
   private links: WorkspaceLink[] = [];
   private layout: SavedLayout | undefined;
+  private nodeTypes: NodeType[] = [];
   private lock: WorkspaceLock | undefined;
 
   constructor(private readonly options: WorkspaceOptions) {}
 
   state(): WorkspaceState {
-    if (!this.root) return { open: false, nodes: [], links: [] };
-    return { open: true, name: basename(this.root), nodes: this.nodes, links: this.links, ...(this.layout ? { layout: this.layout } : {}) };
+    if (!this.root) return { open: false, nodes: [], links: [], nodeTypes: [] };
+    return { open: true, name: basename(this.root), nodes: this.nodes, links: this.links, nodeTypes: this.nodeTypes, ...(this.layout ? { layout: this.layout } : {}) };
+  }
+
+  /** The type and property values of a node made from `input`: its type must be one of the workspace's (see `propertyValues` for the values). */
+  private typeFields(input: NodeInput): Pick<TerraneNode, 'type' | 'properties'> {
+    const type = this.nodeTypes.find((candidate) => candidate.id === input.type);
+    if (!type) throw new Error('No such node type in the workspace');
+    return { type: type.id, properties: propertyValues(type, input.properties) };
+  }
+
+  /** A node type's name must be one no other type has. */
+  private checkTypeName(name: string, id?: string): void {
+    if (this.nodeTypes.some((type) => type.name === name && type.id !== id)) throw new Error(`Another node type is called ${name}`);
+  }
+
+  /** Records a node type made from `input` in the `nodeTypes` of `workspace.json`; refused if another type has its name. */
+  async createNodeType(input: NodeTypeInput): Promise<OpenResult> {
+    try {
+      const root = this.root;
+      if (!root) throw new Error('No workspace is open');
+      this.checkTypeName(input.name);
+      const nodeTypes = [...this.nodeTypes, nodeTypeFrom(randomUUID(), input)];
+      await this.writeEntries(root, { nodeTypes });
+      this.nodeTypes = nodeTypes;
+      return { status: 'opened', workspace: this.state() };
+    } catch (error) {
+      return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
+    }
+  }
+
+  /**
+   * Replaces the node type `id` with one made from `input` (refused if another type has its name). Its nodes keep their
+   * values for the properties it still has (of the same kind); a property that is new, or whose kind changed, takes its
+   * default value, and values for properties it no longer has are dropped.
+   */
+  async updateNodeType(id: string, input: NodeTypeInput): Promise<OpenResult> {
+    try {
+      const root = this.root;
+      if (!root) throw new Error('No workspace is open');
+      const current = this.nodeTypes.find((type) => type.id === id);
+      if (!current) throw new Error('No such node type in the workspace');
+      this.checkTypeName(input.name, id);
+      const type = nodeTypeFrom(id, input, current);
+      const nodeTypes = this.nodeTypes.map((candidate) => (candidate.id === id ? type : candidate));
+      const nodes = typedNodes(this.nodes, nodeTypes);
+      await this.writeEntries(root, { nodeTypes, nodes });
+      [this.nodeTypes, this.nodes] = [nodeTypes, nodes];
+      return { status: 'opened', workspace: this.state() };
+    } catch (error) {
+      return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
+    }
+  }
+
+  /** Deletes the node type `id` (the default type cannot be deleted); its nodes become nodes of the default type. */
+  async deleteNodeType(id: string): Promise<OpenResult> {
+    try {
+      const root = this.root;
+      if (!root) throw new Error('No workspace is open');
+      if (id === DEFAULT_TYPE_ID) throw new Error('The default node type cannot be deleted');
+      if (!this.nodeTypes.some((type) => type.id === id)) throw new Error('No such node type in the workspace');
+      const nodeTypes = this.nodeTypes.filter((type) => type.id !== id);
+      const nodes = typedNodes(this.nodes, nodeTypes);
+      await this.writeEntries(root, { nodeTypes, nodes });
+      [this.nodeTypes, this.nodes] = [nodeTypes, nodes];
+      return { status: 'opened', workspace: this.state() };
+    } catch (error) {
+      return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
+    }
   }
 
   /** The open workspace's folder. */
@@ -219,13 +372,17 @@ export class Workspace {
     return this.root;
   }
 
-  /** Records a node made from `input` in the `nodes` of `workspace.json`, copying its file into the workspace folder if `input.file.copy` is set. */
+  /**
+   * Records a node made from `input` in the `nodes` of `workspace.json`, copying its file into the workspace folder if
+   * `input.file.copy` is set. A title another node has is given an integer at its end (see `uniqueTitle`).
+   */
   async createNode(input: NodeInput): Promise<OpenResult> {
     try {
       const root = this.root;
       if (!root) throw new Error('No workspace is open');
       const texts = textFields(input);
-      let node: NodeRecord = { id: randomUUID(), addedAt: new Date().toISOString(), ...texts };
+      texts.title = uniqueTitle(texts.title, new Set(this.nodes.map((other) => other.title)));
+      let node: NodeRecord = { id: randomUUID(), addedAt: new Date().toISOString(), ...texts, ...this.typeFields(input) };
       let copied: string | undefined;
       if (input.file) {
         const { source, copy } = input.file;
@@ -249,10 +406,16 @@ export class Workspace {
    * and a link for each object in the array under `linksKey`. A key the file does not have, or that does not hold an
    * array, is skipped. Nodes and links are written to `workspace.json` together.
    *
-   * A node takes its `title`, `description` and `body`, and shows the first of them with text; an object with none is
-   * skipped. A link joins its `source` and `target`, each the `id` of a node in the file (or, failing that, of a node
-   * already in the workspace), and takes its `weight` (1 to 10, else that of a new link) and `description`. A link is
-   * skipped if either end is not found, if both ends are the same node, or if the two nodes are already linked.
+   * A node takes its `title`, `description` and `body`, and shows the first of them with text (its title if it has none);
+   * it is of the default type.
+   * A node without a title is given one made from the first 25 characters of its `description`, `body`, `filename`,
+   * `path` (its last part), `name` or `label`, whichever is first to have text, or else "Node"; a title already taken (by a
+   * node in the workspace or one imported before it) is given an integer at its end ("Node2", "Node3", …).
+   *
+   * A link joins its `source` and `target`, each identifying a node by id or by title: the `id` of a node in the file, the
+   * title it has in the file, the id of a node already in the workspace, or the title of any node in the workspace
+   * (imported or not), tried in that order. It takes its `weight` (1 to 10, else that of a new link) and `description`. A
+   * link is skipped if either end is not found, if both ends are the same node, or if the two nodes are already linked.
    */
   async importFile(file: string, { nodesKey, linksKey }: ImportKeys): Promise<OpenResult & { nodes?: number; links?: number }> {
     try {
@@ -273,25 +436,35 @@ export class Workspace {
       };
 
       const addedAt = new Date().toISOString();
+      const entries = objects(nodesKey).map((entry) => {
+        const path = importedText(entry.path);
+        const [description, body] = [importedText(entry.description), importedText(entry.body)];
+        const fallback = () => titleFrom([description, body, importedText(entry.filename), path?.split(/[\\/]/).pop(), importedText(entry.name), importedText(entry.label)]);
+        return { entry, given: importedText(entry.title)?.trim() ?? '', description, body, fallback };
+      });
+      const titles = uniqueTitles(entries, new Set(this.nodes.map((node) => node.title)));
+      const defaultType = this.nodeTypes.find((type) => type.id === DEFAULT_TYPE_ID)!;
       const nodes: NodeRecord[] = [];
-      /** The workspace id of each imported node, by its `id` in the file. */
+      /** The workspace id of each imported node, by its `id` in the file, and by the title it has in the file. */
       const imported = new Map<string, string>();
-      for (const entry of objects(nodesKey)) {
-        const fields = Object.fromEntries(DISPLAY_FIELDS.map((field) => [field, importedText(entry[field])])) as Record<DisplayField, string | null>;
-        const shown = DISPLAY_FIELDS.find((field) => fields[field] !== null);
-        if (!shown) continue;
-        const node: NodeRecord = { id: randomUUID(), addedAt, ...fields, display: [shown] };
+      const importedTitles = new Map<string, string>();
+      entries.forEach(({ entry, given, description, body }, index) => {
+        const shown: DisplayField = given !== '' ? 'title' : description !== null ? 'description' : body !== null ? 'body' : 'title';
+        const node: NodeRecord = { id: randomUUID(), addedAt, title: titles[index], description, body, display: [shown], type: defaultType.id, properties: propertyValues(defaultType, {}) };
         nodes.push(node);
         const key = importedKey(entry.id);
         if (key !== null && !imported.has(key)) imported.set(key, node.id);
-      }
+        if (given !== '' && !importedTitles.has(given)) importedTitles.set(given, node.id);
+      });
 
       const existing = new Set(this.nodes.map((node) => node.id));
-      /** The workspace id of a link's end: an imported node's, else a node already in the workspace. */
+      /** Every node's id by its title, whether it was already in the workspace or imported. */
+      const byTitle = new Map([...this.nodes, ...nodes].map((node) => [node.title, node.id]));
+      /** The workspace id of a link's end (see above for the order in which ids and titles are tried). */
       const end = (value: unknown) => {
         const key = importedKey(value);
         if (key === null) return undefined;
-        return imported.get(key) ?? (existing.has(key) ? key : undefined);
+        return imported.get(key) ?? importedTitles.get(key.trim()) ?? (existing.has(key) ? key : undefined) ?? byTitle.get(key.trim());
       };
       const links = [...this.links];
       let linked = 0;
@@ -317,7 +490,8 @@ export class Workspace {
   }
 
   /**
-   * Replaces the node `id` with one made from `input` in the `nodes` of `workspace.json`. A node with a file keeps one. Its
+   * Replaces the node `id` with one made from `input` in the `nodes` of `workspace.json`; a title another node has is given
+   * an integer at its end (see `uniqueTitle`). A node with a file keeps one. Its
    * file is copied into the workspace folder if `input.file.copy` is newly set; a file already copied in stays copied
    * unless another file is chosen, and then the old copy is removed from the folder unless `input.keepOldCopy` is set.
    */
@@ -328,7 +502,8 @@ export class Workspace {
       const current = this.nodes.find((node) => node.id === id);
       if (!current) throw new Error('No such node in the workspace');
       const texts = textFields(input);
-      let node: NodeRecord = { id, addedAt: current.addedAt, ...texts };
+      texts.title = uniqueTitle(texts.title, new Set(this.nodes.filter((other) => other.id !== id).map((other) => other.title)));
+      let node: NodeRecord = { id, addedAt: current.addedAt, ...texts, ...this.typeFields(input) };
       const currentFile = isFileNode(current) ? current : undefined;
       const wasCopied = currentFile !== undefined && !isAbsolute(currentFile.path);
       let copied: string | undefined;
@@ -400,6 +575,46 @@ export class Workspace {
     }
   }
 
+  /**
+   * Deletes the node `id` from `workspace.json`, with every link to or from it and its position in the saved layout. If
+   * its file was copied into the workspace (and no other node has it), the copy is removed from the folder unless
+   * `keepCopy` is set.
+   */
+  async deleteNode(id: string, keepCopy = false): Promise<OpenResult> {
+    try {
+      const root = this.root;
+      if (!root) throw new Error('No workspace is open');
+      const node = this.nodes.find((candidate) => candidate.id === id);
+      if (!node) throw new Error('No such node in the workspace');
+      const nodes = this.nodes.filter((candidate) => candidate.id !== id);
+      const links = this.links.filter((link) => link.source !== id && link.target !== id);
+      const layout = this.layout && { ...this.layout, positions: Object.fromEntries(Object.entries(this.layout.positions).filter(([placed]) => placed !== id)) };
+      await this.writeEntries(root, { nodes, links, ...(layout ? { layout } : {}) });
+      [this.nodes, this.links, this.layout] = [nodes, links, layout];
+      const copy = isFileNode(node) && !isAbsolute(node.path) ? node.path : undefined;
+      const shared = nodes.some((other) => isFileNode(other) && other.path === copy);
+      if (copy && !keepCopy && !shared && basename(copy) === copy) await rm(join(root, copy), { force: true });
+      return { status: 'opened', workspace: this.state() };
+    } catch (error) {
+      return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
+    }
+  }
+
+  /** Deletes the link `id` from `workspace.json`. */
+  async deleteLink(id: string): Promise<OpenResult> {
+    try {
+      const root = this.root;
+      if (!root) throw new Error('No workspace is open');
+      if (!this.links.some((link) => link.id === id)) throw new Error('No such link in the workspace');
+      const links = this.links.filter((link) => link.id !== id);
+      await this.writeLinks(root, links);
+      this.links = links;
+      return { status: 'opened', workspace: this.state() };
+    } catch (error) {
+      return { status: 'failed', message: error instanceof Error ? error.message : String(error), workspace: this.state() };
+    }
+  }
+
   /** Records `layout` (see SavedLayout) as the `layout` of `workspace.json`, replacing any there. */
   async saveLayout(layout: unknown): Promise<void> {
     const root = this.root;
@@ -443,6 +658,7 @@ export class Workspace {
     this.nodes = [];
     this.links = [];
     this.layout = undefined;
+    this.nodeTypes = [];
     if (!lock) return;
     await lock.release();
     await this.runHook(() => this.options.onClosed?.());
@@ -457,8 +673,11 @@ export class Workspace {
     let nodes: NodeRecord[];
     let links: WorkspaceLink[];
     let layout: SavedLayout | undefined;
+    let nodeTypes: NodeType[];
     try {
-      nodes = await this.loadNodes(folder);
+      // The default type is always there, but is written to the file only once the types change.
+      nodeTypes = loadedNodeTypes((await this.readInfo(folder)).nodeTypes);
+      nodes = await this.loadNodes(folder, nodeTypes);
       links = await this.loadLinks(folder);
       layout = await this.loadLayout(folder, nodes);
     } catch (error) {
@@ -471,6 +690,7 @@ export class Workspace {
     this.nodes = nodes;
     this.links = links;
     this.layout = layout;
+    this.nodeTypes = nodeTypes;
     await this.runHook(() => this.options.onOpened?.(folder));
   }
 
@@ -483,10 +703,20 @@ export class Workspace {
     await writeFile(file, JSON.stringify(info, null, 2) + '\n', { flag: 'wx' });
   }
 
-  /** Reads the `nodes` of `workspace.json`, adding an empty `nodes` array to a file that has none. */
-  private async loadNodes(folder: string): Promise<NodeRecord[]> {
+  /**
+   * Reads the `nodes` of `workspace.json`, adding an empty `nodes` array to a file that has none. A node without a title,
+   * or with one an earlier node has, is given a unique one (see `titledNodes`); a node of no type in `types` is of the
+   * default type, and each node has a value for each of its type's properties (see `typedNodes`). If any node changed,
+   * the nodes are written back.
+   */
+  private async loadNodes(folder: string, types: NodeType[]): Promise<NodeRecord[]> {
     const info = await this.readInfo(folder);
-    if (Array.isArray(info.nodes)) return info.nodes as NodeRecord[];
+    if (Array.isArray(info.nodes)) {
+      const nodes = info.nodes as NodeRecord[];
+      const loaded = typedNodes(titledNodes(nodes), types);
+      if (loaded.some((node, index) => node !== nodes[index])) await this.writeNodes(folder, loaded);
+      return loaded;
+    }
     await this.writeNodes(folder, []);
     return [];
   }
@@ -534,7 +764,7 @@ export class Workspace {
   }
 
   /** Replaces the given entries of `workspace.json`, leaving its others as they are. The file is swapped in whole. */
-  private async writeEntries(folder: string, entries: { nodes?: NodeRecord[]; links?: WorkspaceLink[]; layout?: SavedLayout }): Promise<void> {
+  private async writeEntries(folder: string, entries: { nodes?: NodeRecord[]; links?: WorkspaceLink[]; layout?: SavedLayout; nodeTypes?: NodeType[] }): Promise<void> {
     const info = { ...(await this.readInfo(folder)), ...entries };
     const file = join(folder, WORKSPACE_FILE);
     const temp = `${file}.${process.pid}.tmp`;
